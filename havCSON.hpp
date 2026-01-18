@@ -7,13 +7,14 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 
 REVISION HISTORY
 
+v0.2 (2026-01-18) - Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
 v0.1 (2025-12-15) - First release.
 
 LICENSE
 
 MIT License
 
-Copyright (c) 2025 René Nicolaus
+Copyright (c) 2025-2026 René Nicolaus
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -68,6 +69,7 @@ SOFTWARE.
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <fstream>
 #include <memory>
@@ -120,8 +122,7 @@ namespace havCSON
   }
 
   // Cross-platform FILE opener that accepts UTF-8 paths and uses wide APIs on Windows
-  inline std::unique_ptr<std::FILE, decltype(&std::fclose)>
-  OpenFileUTF8(const std::string& path, const std::string& mode)
+  inline std::unique_ptr<std::FILE, decltype(&std::fclose)> OpenFileUTF8(const std::string& path, const std::string& mode)
   {
     std::unique_ptr<std::FILE, decltype(&std::fclose)> fileStream(nullptr, &std::fclose);
     std::wstring modeW = ConvertStringToWString(mode, true);
@@ -134,8 +135,7 @@ namespace havCSON
     return fileStream;
   }
 #else
-  inline std::unique_ptr<std::FILE, decltype(&std::fclose)>
-  OpenFileUTF8(const std::string& path, const std::string& mode)
+  inline std::unique_ptr<std::FILE, decltype(&std::fclose)> OpenFileUTF8(const std::string& path, const std::string& mode)
   {
     std::unique_ptr<std::FILE, decltype(&std::fclose)> fileStream(nullptr, &std::fclose);
     fileStream.reset(std::fopen(path.c_str(), mode.c_str()));
@@ -268,8 +268,8 @@ namespace havCSON
       std::size_t badIndex = 0;
       std::size_t badLine = 1;
       std::size_t badCol = 1;
-      bool hasBOM = mSrc.size() >= 3 && static_cast<unsigned char>(mSrc[0]) == 0xEF &&
-        static_cast<unsigned char>(mSrc[1]) == 0xBB && static_cast<unsigned char>(mSrc[2]) == 0xBF;
+      bool hasBOM = mSrc.size() >= 3 && static_cast<unsigned char>(mSrc[0]) == 0xEF && static_cast<unsigned char>(mSrc[1]) == 0xBB &&
+        static_cast<unsigned char>(mSrc[2]) == 0xBF;
       if (!ValidateUTF8(mSrc, true, badIndex, badLine, badCol))
       {
         mPos = badIndex;
@@ -673,12 +673,7 @@ namespace havCSON
       }
     }
 
-    bool ValidateUTF8(
-      std::string_view stringView,
-      bool allowLeadingBOM,
-      std::size_t& badIndex,
-      std::size_t& badLine,
-      std::size_t& badCol)
+    bool ValidateUTF8(std::string_view stringView, bool allowLeadingBOM, std::size_t& badIndex, std::size_t& badLine, std::size_t& badCol)
     {
       std::size_t index = 0;
       badLine = 1;
@@ -701,15 +696,14 @@ namespace havCSON
         unsigned char c = static_cast<unsigned char>(stringView[index]);
 
         if (
-          index == 0 && allowLeadingBOM && stringView.size() >= 3 && c == 0xEF &&
-          static_cast<unsigned char>(stringView[1]) == 0xBB && static_cast<unsigned char>(stringView[2]) == 0xBF)
+          index == 0 && allowLeadingBOM && stringView.size() >= 3 && c == 0xEF && static_cast<unsigned char>(stringView[1]) == 0xBB &&
+          static_cast<unsigned char>(stringView[2]) == 0xBF)
         {
           index += 3;
           continue;
         }
         else if (
-          index > 0 && c == 0xEF && index + 2 < stringView.size() &&
-          static_cast<unsigned char>(stringView[index + 1]) == 0xBB &&
+          index > 0 && c == 0xEF && index + 2 < stringView.size() && static_cast<unsigned char>(stringView[index + 1]) == 0xBB &&
           static_cast<unsigned char>(stringView[index + 2]) == 0xBF)
         {
           badIndex = index;
@@ -764,8 +758,7 @@ namespace havCSON
 
         if (
           (length == 2 && codePoint < 0x80) || (length == 3 && codePoint < 0x800) ||
-          (length == 4 && (codePoint < 0x10000 || codePoint > 0x10FFFF)) ||
-          (codePoint >= 0xD800 && codePoint <= 0xDFFF))
+          (length == 4 && (codePoint < 0x10000 || codePoint > 0x10FFFF)) || (codePoint >= 0xD800 && codePoint <= 0xDFFF))
         {
           badIndex = index;
           return false;
@@ -833,7 +826,6 @@ namespace havCSON
     ErrorCode parseIdentifierOrIndentedObject(Value& out, int currentIndent)
     {
       std::string ident;
-      LocationEntry startLoc = Location();
       while (IsIdentifierChar(Peek()))
       {
         ident.push_back(Get());
@@ -1680,8 +1672,8 @@ namespace havCSON
         std::size_t badIndex = 0;
         std::size_t badLine = 1;
         std::size_t badCol = 1;
-        bool hasBOM = mSrc.size() >= 3 && static_cast<unsigned char>(mSrc[0]) == 0xEF &&
-          static_cast<unsigned char>(mSrc[1]) == 0xBB && static_cast<unsigned char>(mSrc[2]) == 0xBF;
+        bool hasBOM = mSrc.size() >= 3 && static_cast<unsigned char>(mSrc[0]) == 0xEF && static_cast<unsigned char>(mSrc[1]) == 0xBB &&
+          static_cast<unsigned char>(mSrc[2]) == 0xBF;
         if (!ValidateUTF8(mSrc, true, badIndex, badLine, badCol))
         {
           mPos = badIndex;
@@ -2612,8 +2604,7 @@ namespace havCSON
       InArray,
     };
 
-    inline void
-    WriteValue(const Value& value, std::string& out, int indentLevel, const WriteOptions& opt, WriteContext ctx);
+    inline void WriteValue(const Value& value, std::string& out, int indentLevel, const WriteOptions& opt, WriteContext ctx);
 
     using ObjectItemView = std::pair<std::string_view, const Value*>;
 
@@ -2668,12 +2659,101 @@ namespace havCSON
       out.push_back('"');
     }
 
+    inline std::string FormatNumber(double value)
+    {
+      std::string result = std::to_string(value);
+      const std::size_t dot = result.find('.');
+      if (dot == std::string::npos)
+      {
+        return result;
+      }
+      std::size_t trimEnd = result.size(); // Erase from here after trimming trailing zeros
+      while (trimEnd > dot + 1 && result[trimEnd - 1] == '0')
+      {
+        --trimEnd;
+      }
+      if (trimEnd == dot + 1)
+      {
+        result.erase(dot + 1);
+        result.push_back('0');
+        return result;
+      }
+      result.erase(trimEnd);
+      return result;
+    }
+
+    inline bool ValidateFiniteNumbers(const Value& value, Error* error)
+    {
+      if (std::holds_alternative<double>(value))
+      {
+        if (!std::isfinite(std::get<double>(value)))
+        {
+          if (error)
+          {
+            error->code = ErrorCode::InvalidNumber;
+            error->where = {};
+            error->message = "Non-finite number value";
+          }
+          return false;
+        }
+        return true;
+      }
+      if (std::holds_alternative<Array>(value))
+      {
+        for (const auto& child : std::get<Array>(value))
+        {
+          if (!ValidateFiniteNumbers(child, error))
+          {
+            return false;
+          }
+        }
+        return true;
+      }
+      if (std::holds_alternative<Object>(value))
+      {
+        for (const auto& entry : std::get<Object>(value))
+        {
+          if (!ValidateFiniteNumbers(entry.second, error))
+          {
+            return false;
+          }
+        }
+        return true;
+      }
+      return true;
+    }
+
+    inline bool ValidateFiniteNumbers(const LosslessValue& value, Error* error)
+    {
+      if (std::holds_alternative<Array>(value.value) && !value.arrayItems.empty())
+      {
+        for (const auto& child : value.arrayItems)
+        {
+          if (!ValidateFiniteNumbers(child, error))
+          {
+            return false;
+          }
+        }
+        return true;
+      }
+      if (std::holds_alternative<Object>(value.value) && !value.objectItems.empty())
+      {
+        for (const auto& entry : value.objectItems)
+        {
+          if (!ValidateFiniteNumbers(entry.second, error))
+          {
+            return false;
+          }
+        }
+        return true;
+      }
+      return ValidateFiniteNumbers(value.value, error);
+    }
+
     // "Simple" scalars for inline arrays
     inline bool IsSimpleScalar(const Value& value)
     {
-      if (
-        std::holds_alternative<std::nullptr_t>(value) || std::holds_alternative<bool>(value) ||
-        std::holds_alternative<double>(value))
+      if (std::holds_alternative<std::nullptr_t>(value) || std::holds_alternative<bool>(value) || std::holds_alternative<double>(value))
       {
         return true;
       }
@@ -2724,7 +2804,7 @@ namespace havCSON
       }
       else if (std::holds_alternative<double>(value))
       {
-        out += std::to_string(std::get<double>(value));
+        out += FormatNumber(std::get<double>(value));
       }
       else if (std::holds_alternative<std::string>(value))
       {
@@ -2891,8 +2971,7 @@ namespace havCSON
       }
     }
 
-    inline void
-    WriteArray(const Array& array, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
+    inline void WriteArray(const Array& array, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
     {
       // LOGIC:
       //  1. If array is small and all "simple" scalars -> inline: [1, 2, 3]
@@ -2978,8 +3057,7 @@ namespace havCSON
       out.push_back(']');
     }
 
-    inline void
-    WriteValue(const Value& value, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
+    inline void WriteValue(const Value& value, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
     {
       if (std::holds_alternative<std::nullptr_t>(value))
       {
@@ -2991,7 +3069,7 @@ namespace havCSON
       }
       else if (std::holds_alternative<double>(value))
       {
-        out += std::to_string(std::get<double>(value));
+        out += FormatNumber(std::get<double>(value));
       }
       else if (std::holds_alternative<std::string>(value))
       {
@@ -3022,17 +3100,35 @@ namespace havCSON
 
   } // namespace detail
 
+  inline bool ToString(const Value& value, std::string& out, const WriteOptions& options = {}, Error* error = nullptr)
+  {
+    if (!detail::ValidateFiniteNumbers(value, error))
+    {
+      return false;
+    }
+    out.clear();
+    detail::WriteValue(value, out, 0, options, detail::WriteContext::Root);
+    if (error)
+    {
+      *error = {};
+    }
+    return true;
+  }
+
   inline std::string ToString(const Value& value, const WriteOptions& options = {})
   {
-    std::string out;
-    detail::WriteValue(value, out, 0, options, detail::WriteContext::Root);
-    return out;
+    std::string result;
+    Error error;
+    if (!ToString(value, result, options, &error))
+    {
+      return {};
+    }
+    return result;
   }
 
   namespace detail
   {
-    inline void
-    WriteCommentLines(const std::vector<LosslessComment>& lines, std::string& out, const WriteOptions& options)
+    inline void WriteCommentLines(const std::vector<LosslessComment>& lines, std::string& out, const WriteOptions& options)
     {
       bool prevNonEmpty = false;
       for (const auto& line : lines)
@@ -3056,12 +3152,8 @@ namespace havCSON
       }
     }
 
-    inline void WriteLosslessValue(
-      const LosslessValue& value,
-      std::string& out,
-      int indentLevel,
-      const WriteOptions& options,
-      WriteContext ctx)
+    inline void
+    WriteLosslessValue(const LosslessValue& value, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
     {
       WriteCommentLines(value.leadingComments, out, options);
 
@@ -3181,15 +3273,33 @@ namespace havCSON
     }
   } // namespace detail
 
-  inline std::string ToStringLossless(const LosslessValue& value, const WriteOptions& options = {})
+  inline bool ToStringLossless(const LosslessValue& value, std::string& out, const WriteOptions& options = {}, Error* error = nullptr)
   {
-    std::string out;
+    if (!detail::ValidateFiniteNumbers(value, error))
+    {
+      return false;
+    }
+    out.clear();
     detail::WriteLosslessValue(value, out, 0, options, detail::WriteContext::Root);
-    return out;
+    if (error)
+    {
+      *error = {};
+    }
+    return true;
   }
 
-  inline bool
-  WriteFile(const std::string& path, const Value& value, const WriteOptions& options = {}, Error* error = nullptr)
+  inline std::string ToStringLossless(const LosslessValue& value, const WriteOptions& options = {})
+  {
+    std::string result;
+    Error error;
+    if (!ToStringLossless(value, result, options, &error))
+    {
+      return {};
+    }
+    return result;
+  }
+
+  inline bool WriteFile(const std::string& path, const Value& value, const WriteOptions& options = {}, Error* error = nullptr)
   {
     auto fileStream = OpenFileUTF8(path, "wb");
     if (!fileStream)
@@ -3202,7 +3312,11 @@ namespace havCSON
       }
       return false;
     }
-    std::string stringValue = ToString(value, options);
+    std::string stringValue;
+    if (!ToString(value, stringValue, options, error))
+    {
+      return false;
+    }
     if (!stringValue.empty())
     {
       if (std::fwrite(stringValue.data(), 1, stringValue.size(), fileStream.get()) != stringValue.size())
@@ -3223,11 +3337,8 @@ namespace havCSON
     return true;
   }
 
-  inline bool WriteFileLossless(
-    const std::string& path,
-    const LosslessValue& value,
-    const WriteOptions& options = {},
-    Error* error = nullptr)
+  inline bool
+  WriteFileLossless(const std::string& path, const LosslessValue& value, const WriteOptions& options = {}, Error* error = nullptr)
   {
     auto fileStream = OpenFileUTF8(path, "wb");
     if (!fileStream)
@@ -3240,7 +3351,11 @@ namespace havCSON
       }
       return false;
     }
-    std::string stringValue = ToStringLossless(value, options);
+    std::string stringValue;
+    if (!ToStringLossless(value, stringValue, options, error))
+    {
+      return false;
+    }
     if (!stringValue.empty())
     {
       if (std::fwrite(stringValue.data(), 1, stringValue.size(), fileStream.get()) != stringValue.size())
@@ -3262,9 +3377,13 @@ namespace havCSON
   }
 
   // Simple JSON writer without pretty-printing
-  inline std::string ToJsonString(const Value& value)
+  inline bool ToJsonString(const Value& value, std::string& out, Error* error = nullptr)
   {
-    std::string out;
+    if (!detail::ValidateFiniteNumbers(value, error))
+    {
+      return false;
+    }
+    out.clear();
 
     // JSON writer
     struct Writer
@@ -3299,7 +3418,7 @@ namespace havCSON
         }
         else if (std::holds_alternative<double>(value))
         {
-          out += std::to_string(std::get<double>(value));
+          out += detail::FormatNumber(std::get<double>(value));
         }
         else if (std::holds_alternative<std::string>(value))
         {
@@ -3342,7 +3461,22 @@ namespace havCSON
     };
 
     Writer::Write(value, out);
-    return out;
+    if (error)
+    {
+      *error = {};
+    }
+    return true;
+  }
+
+  inline std::string ToJsonString(const Value& value)
+  {
+    std::string result;
+    Error error;
+    if (!ToJsonString(value, result, &error))
+    {
+      return {};
+    }
+    return result;
   }
 }
 

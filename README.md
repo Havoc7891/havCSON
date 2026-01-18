@@ -58,7 +58,11 @@ if (code != ErrorCode::OK)
 Value parsed = ParseOrThrow("foo: 1");
 
 // Convert to JSON string without pretty-printing
-std::string json = ToJsonString(config);
+std::string json;
+if (!ToJsonString(config, json, &error))
+{
+  std::cerr << "JSON conversion failed: " << error.message << "\n";
+}
 ```
 
 #### Write CSON file
@@ -83,7 +87,11 @@ if (!WriteFile("out.cson", root, options, &error))
 }
 
 // Get the formatted string without touching disk
-std::string text = ToString(root, options);
+std::string text;
+if (!ToString(root, text, options, &error))
+{
+  std::cerr << "Formatting failed: " << error.message << "\n";
+}
 ```
 
 #### Parse from a string and mutate the data
@@ -101,7 +109,16 @@ obj["active"] = true;
 // Push another tag
 obj["tags"].asArray().push_back("oss");
 
-std::cout << ToString(value) << "\n";
+Error error;
+std::string formatted;
+if (!ToString(value, formatted, {}, &error))
+{
+  std::cerr << "Formatting failed: " << error.message << "\n";
+}
+else
+{
+  std::cout << formatted << "\n";
+}
 ```
 
 #### Create an array and array entries
@@ -171,15 +188,21 @@ if (ParseLossless(src, lossless, &error) != ErrorCode::OK)
 }
 
 // Keep comments / spacing when writing back out
-std::string roundtrip = ToStringLossless(lossless);
+std::string roundtrip;
+if (!ToStringLossless(lossless, roundtrip, {}, &error))
+{
+  std::cerr << "Lossless formatting failed: " << error.message << "\n";
+}
 ```
 
 ## Contributing
 
-Feel free to suggest features or report issues. However, please note that pull requests will not be accepted.
+Thank you for your interest! Suggestions for features and bug reports are always welcome via issues.
+
+To maintain a consistent design and quality for this library, changes are implemented by the maintainer rather than via direct pull requests.
 
 ## License
 
-Copyright &copy; 2025 Ren&eacute; Nicolaus
+Copyright &copy; 2025-2026 Ren&eacute; Nicolaus
 
 This library is released under the [MIT license](/LICENSE).
