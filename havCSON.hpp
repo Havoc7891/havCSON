@@ -7,6 +7,7 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 
 REVISION HISTORY
 
+v0.3 (2026-05-15) - Simplified platform type size checks.
 v0.2 (2026-01-18) - Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
 v0.1 (2025-12-15) - First release.
 
@@ -68,6 +69,7 @@ SOFTWARE.
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <climits>
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -82,16 +84,7 @@ SOFTWARE.
 #include <variant>
 #include <vector>
 
-static_assert(sizeof(signed char) == 1, "expected char to be 1 byte");
-static_assert(sizeof(unsigned char) == 1, "expected unsigned char to be 1 byte");
-static_assert(sizeof(signed char) == 1, "expected int8 to be 1 byte");
-static_assert(sizeof(unsigned char) == 1, "expected uint8 to be 1 byte");
-static_assert(sizeof(signed short int) == 2, "expected int16 to be 2 bytes");
-static_assert(sizeof(unsigned short int) == 2, "expected uint16 to be 2 bytes");
-static_assert(sizeof(signed int) == 4, "expected int32 to be 4 bytes");
-static_assert(sizeof(unsigned int) == 4, "expected uint32 to be 4 bytes");
-static_assert(sizeof(signed long long) == 8, "expected int64 to be 8 bytes");
-static_assert(sizeof(unsigned long long) == 8, "expected uint64 to be 8 bytes");
+static_assert(CHAR_BIT == 8, "havCSON requires 8-bit bytes");
 
 namespace havCSON
 {
