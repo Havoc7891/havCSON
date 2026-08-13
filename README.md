@@ -16,11 +16,15 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 - Single-header, dependency-free (just include `havCSON.hpp`)
 - Reading and writing CSON files (from strings or UTF-8 file paths)
   - Also supports generating CSON files from scratch
-- Optional throwing parse API (`ParseOrThrow`) in addition to error-code based parsing
+  - Atomic file writers safely replace an existing file after the new contents are flushed
+- Error-code and optional throwing parse APIs, including lossless parsing helpers
+- Duplicate object keys are rejected with `ErrorCode::DuplicateKey`
+- Finite `double` values use round-trip-safe parsing and formatting
 - Convert parsed data to JSON text via `ToJsonString`
 - Pretty-print output with controllable indent width and optional key sorting
-- Lossless round-trip mode that keeps comments / blank lines / ordering with matching write helpers
+- Comment-aware round trips preserve comments (including comments after `:` or before a closing delimiter), blank lines, and member ordering while regenerating normalized CSON
 - Unicode / UTF-8 support with validation
+- Compile-time version constants (`VersionMajor`, `VersionMinor`, `VersionPatch`, and `VersionString`)
 
 ## Getting Started
 
@@ -36,7 +40,7 @@ Copy the header file into your project folder and include the file like this:
 
 ### Usage
 
-Here are some code examples demonstrating how to use the library. Each snippet is independent; copy the header and drop the snippet you need into your code.
+Here are some code examples demonstrating how to use the library. The iteration and lookup snippets reuse `player` from the array-construction example; the other snippets are independent.
 
 #### Read CSON file
 
@@ -49,7 +53,8 @@ Error error;
 auto code = ParseFile("config.cson", config, &error);
 if (code != ErrorCode::OK)
 {
-  std::cerr << "Failed: line " << error.where.line << " col " << error.where.column
+  std::cerr << "Failed to parse " << error.filename << ": line " << error.where.line
+            << " col " << error.where.column
             << " (" << error.message << ")\n";
   return;
 }
@@ -65,7 +70,25 @@ if (!ToJsonString(config, json, &error))
 }
 ```
 
-#### Write CSON file
+#### Reject duplicate object keys
+
+```cpp
+using namespace havCSON;
+
+Value value;
+Error error;
+auto code = Parse("name: \"first\"\nname: \"second\"\n", value, &error);
+if (code == ErrorCode::DuplicateKey)
+{
+  std::cerr << error.message << " at line " << error.where.line << "\n";
+}
+```
+
+Duplicate keys are rejected in both normal and lossless parsing instead of silently replacing or ignoring a value.
+
+#### Write CSON file atomically
+
+Numbers are stored as `double`. Finite values are formatted so that writing and parsing them recovers the same value; the original numeric spelling is not retained.
 
 ```cpp
 using namespace havCSON;
@@ -81,9 +104,9 @@ options.indentWidth = 2;
 options.sortObjectKeys = true;
 
 Error error;
-if (!WriteFile("out.cson", root, options, &error))
+if (!WriteFileAtomic("out.cson", root, options, &error))
 {
-  std::cerr << "Write failed: " << error.message << "\n";
+  std::cerr << "Atomic write failed: " << error.message << "\n";
 }
 
 // Get the formatted string without touching disk
@@ -93,6 +116,8 @@ if (!ToString(root, text, options, &error))
   std::cerr << "Formatting failed: " << error.message << "\n";
 }
 ```
+
+`WriteFileAtomic` serializes to a temporary file in the destination directory, flushes it, and then replaces the destination. Use `WriteFile` for a direct write, `WriteTextFileAtomic` for text that is already serialized, or `WriteFileLosslessAtomic` for a `LosslessValue`.
 
 #### Parse from a string and mutate the data
 
@@ -187,13 +212,20 @@ if (ParseLossless(src, lossless, &error) != ErrorCode::OK)
   // Handle
 }
 
-// Keep comments / spacing when writing back out
+// Preserve comments, blank lines, and ordering while normalizing formatting
 std::string roundtrip;
 if (!ToStringLossless(lossless, roundtrip, {}, &error))
 {
   std::cerr << "Lossless formatting failed: " << error.message << "\n";
 }
+
+if (!WriteFileLosslessAtomic("out.cson", lossless, {}, &error))
+{
+  std::cerr << "Lossless atomic write failed: " << error.message << "\n";
+}
 ```
+
+Use `ParseFileLossless` to read directly from a UTF-8 file. `ParseLosslessOrThrow` is the throwing counterpart for string input. Lossless mode retains blank lines, member ordering, and comments in structural positions such as after `key:` and before closing delimiters. It regenerates normalized formatting rather than preserving the original bytes.
 
 ## Contributing
 

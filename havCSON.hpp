@@ -7,9 +7,10 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 
 REVISION HISTORY
 
-v0.3 (2026-05-15) - Simplified platform type size checks.
-v0.2 (2026-01-18) - Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
-v0.1 (2025-12-15) - First release.
+v0.4.0 (2026-08-13) - Added duplicate-key rejection, made finite double parsing and formatting round-trip-safe, fixed lossless parsing and writing, and added atomic file writers.
+v0.3.0 (2026-05-15) - Simplified platform type size checks.
+v0.2.0 (2026-01-18) - Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
+v0.1.0 (2025-12-15) - First release.
 
 LICENSE
 
@@ -44,9 +45,9 @@ SOFTWARE.
     #error "_MBCS is defined, but only Unicode is supported"
   #endif
   #undef _UNICODE
-  #define _UNICODE
+  #define _UNICODE 1
   #undef UNICODE
-  #define UNICODE
+  #define UNICODE 1
 
   #undef NOMINMAX
   #define NOMINMAX
@@ -55,7 +56,8 @@ SOFTWARE.
   #define STRICT
 
   #ifndef _WIN32_WINNT
-    #define _WIN32_WINNT _WIN32_WINNT_WINXP
+    // Current MinGW builds use Windows 7 APIs for C++23 threading support
+    #define _WIN32_WINNT 0x0601
   #endif
   #ifdef _MSC_VER
     #include <SDKDDKVer.h>
@@ -70,24 +72,55 @@ SOFTWARE.
 #include <cstdint>
 #include <cstdlib>
 #include <climits>
+#include <array>
 #include <algorithm>
+#include <charconv>
 #include <cmath>
+#include <cerrno>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#ifndef _WIN32
+  #include <atomic>
+  #include <fcntl.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <unistd.h>
+#endif
+
 static_assert(CHAR_BIT == 8, "havCSON requires 8-bit bytes");
 
 namespace havCSON
 {
+  inline constexpr std::uint32_t VersionMajor = 0;
+  inline constexpr std::uint32_t VersionMinor = 4;
+  inline constexpr std::uint32_t VersionPatch = 0;
+  inline constexpr std::string_view VersionString = "0.4.0";
+
+  struct FileCloser
+  {
+    void operator()(std::FILE* file) const noexcept
+    {
+      if (file)
+      {
+        std::fclose(file);
+      }
+    }
+  };
+
+  using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
+
 #ifdef _WIN32
   // Convert UTF-8 to UTF-16; keep the trailing null when forFileStream is true so _wfopen / _wifstream can use data()
   inline std::wstring ConvertStringToWString(const std::string& value, bool forFileStream = false)
@@ -115,9 +148,9 @@ namespace havCSON
   }
 
   // Cross-platform FILE opener that accepts UTF-8 paths and uses wide APIs on Windows
-  inline std::unique_ptr<std::FILE, decltype(&std::fclose)> OpenFileUTF8(const std::string& path, const std::string& mode)
+  inline FilePtr OpenFileUTF8(const std::string& path, const std::string& mode)
   {
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> fileStream(nullptr, &std::fclose);
+    FilePtr fileStream;
     std::wstring modeW = ConvertStringToWString(mode, true);
     std::wstring pathW = ConvertStringToWString(path, true);
     std::FILE* file = nullptr;
@@ -128,9 +161,9 @@ namespace havCSON
     return fileStream;
   }
 #else
-  inline std::unique_ptr<std::FILE, decltype(&std::fclose)> OpenFileUTF8(const std::string& path, const std::string& mode)
+  inline FilePtr OpenFileUTF8(const std::string& path, const std::string& mode)
   {
-    std::unique_ptr<std::FILE, decltype(&std::fclose)> fileStream(nullptr, &std::fclose);
+    FilePtr fileStream;
     fileStream.reset(std::fopen(path.c_str(), mode.c_str()));
     return fileStream;
   }
@@ -155,6 +188,7 @@ namespace havCSON
     InvalidIndentChar,
     InconsistentIndent,
     InternalError,
+    DuplicateKey,
   };
 
   struct Error
@@ -162,6 +196,7 @@ namespace havCSON
     ErrorCode code = ErrorCode::OK;
     LocationEntry where{};
     std::string message;
+    std::string filename;
 
     explicit operator bool() const
     {
@@ -244,6 +279,8 @@ namespace havCSON
     std::vector<LosslessValue> arrayItems; // In-order children if value is array
     std::vector<std::pair<std::string, LosslessValue>> objectItems; // In-order children if value is object
     std::vector<LosslessComment> trailingComments; // Comments / blank lines after this value (before dedent)
+    std::string blockComment; // Comment after an object key's ':' before a block value
+    std::vector<LosslessComment> closingComments; // Full-line comments immediately before a container's closing delimiter
   };
 
   class Parser
@@ -300,6 +337,7 @@ namespace havCSON
               error->code = errorCode;
               error->where = Location();
               error->message.clear();
+              error->filename = mFilename;
             }
           }
           return errorCode;
@@ -347,7 +385,7 @@ namespace havCSON
 
   protected:
     std::string_view mSrc;
-    std::string_view mFilename;
+    std::string mFilename;
     std::size_t mPos = 0;
     std::size_t mLine = 1;
     std::size_t mCol = 1;
@@ -407,11 +445,30 @@ namespace havCSON
       mError.code = code;
       mError.where = Location();
       mError.message.assign(message.begin(), message.end());
+      mError.filename.assign(mFilename.begin(), mFilename.end());
       if (out)
       {
         *out = mError;
       }
       return code;
+    }
+
+    ErrorCode FailAt(ErrorCode code, LocationEntry where, std::string_view message = {})
+    {
+      mError.code = code;
+      mError.where = where;
+      mError.message.assign(message.begin(), message.end());
+      mError.filename.assign(mFilename.begin(), mFilename.end());
+      return code;
+    }
+
+    ErrorCode CheckDuplicateKey(const Object& object, const std::string& key, LocationEntry where)
+    {
+      if (object.find(key) == object.end())
+      {
+        return ErrorCode::OK;
+      }
+      return FailAt(ErrorCode::DuplicateKey, where, "Duplicate object key '" + key + "'");
     }
 
     void SkipInlineSpaces()
@@ -711,7 +768,7 @@ namespace havCSON
         }
 
         std::uint32_t codePoint = 0;
-        int length = 0;
+        std::size_t length = 0;
         if ((c & 0xE0) == 0xC0)
         {
           length = 2;
@@ -775,15 +832,9 @@ namespace havCSON
       {
         return ParseArray(out, currentIndent);
       }
-      if (c == '"')
+      if (c == '"' || c == '\'')
       {
-        // Could be normal or triple string
-        return ParseStringOrTriple(out);
-      }
-      if (c == '\'')
-      {
-        // Single-quoted string (no multiline)
-        return ParseStringSingle(out);
+        return ParseQuotedStringOrIndentedObject(out, currentIndent);
       }
       if (IsIdentifierStart(c))
       {
@@ -798,6 +849,35 @@ namespace havCSON
         return Fail(ErrorCode::UnexpectedEnd, nullptr, "Unexpected end of input while parsing value");
       }
       return Fail(ErrorCode::UnexpectedChar, nullptr, "Unexpected character while parsing value");
+    }
+
+    ErrorCode ParseQuotedStringOrIndentedObject(Value& out, int currentIndent)
+    {
+      const std::size_t savedPos = mPos;
+      const std::size_t savedLine = mLine;
+      const std::size_t savedColumn = mCol;
+      Value quotedValue;
+      ErrorCode errorCode = Peek() == '"' ? ParseStringOrTriple(quotedValue) : ParseStringSingle(quotedValue);
+      if (errorCode != ErrorCode::OK)
+      {
+        return errorCode;
+      }
+      SkipInlineSpaces();
+      if (Peek() != ':')
+      {
+        out = std::move(quotedValue);
+        return ErrorCode::OK;
+      }
+      mPos = savedPos;
+      mLine = savedLine;
+      mCol = savedColumn;
+      Object object;
+      errorCode = ParseIndentedObjectBody(object, currentIndent);
+      if (errorCode == ErrorCode::OK)
+      {
+        out = std::move(object);
+      }
+      return errorCode;
     }
 
     static bool IsIdentifierStart(char c)
@@ -842,7 +922,7 @@ namespace havCSON
         return ErrorCode::OK;
       }
 
-      // Otherwise interpret as bare identifier value
+      // Otherwise interpret as an unquoted identifier value
       if (ident == "true")
       {
         out = true;
@@ -858,7 +938,7 @@ namespace havCSON
         out = nullptr;
         return ErrorCode::OK;
       }
-      out = ident; // Bare string
+      out = ident; // Unquoted string
       return ErrorCode::OK;
     }
 
@@ -1131,10 +1211,15 @@ namespace havCSON
       }
 
       std::string_view stringView(mSrc.data() + start, mPos - start);
-      char* endPtr = nullptr;
-      std::string tempValue(stringView.begin(), stringView.end());
-      double value = std::strtod(tempValue.c_str(), &endPtr);
-      if (!endPtr || *endPtr != '\0')
+      const char* first = stringView.data();
+      const char* last = first + stringView.size();
+      if (first != last && *first == '+')
+      {
+        ++first;
+      }
+      double value = 0.0;
+      const auto result = std::from_chars(first, last, value, std::chars_format::general);
+      if (first == last || result.ec != std::errc{} || result.ptr != last || !std::isfinite(value))
       {
         return Fail(ErrorCode::InvalidNumber, nullptr, "Invalid number literal");
       }
@@ -1157,8 +1242,14 @@ namespace havCSON
       }
       while (true)
       {
+        const LocationEntry keyLocation = Location();
         std::string key;
         ErrorCode errorCode = ParseKey(key);
+        if (errorCode != ErrorCode::OK)
+        {
+          return errorCode;
+        }
+        errorCode = CheckDuplicateKey(object, key, keyLocation);
         if (errorCode != ErrorCode::OK)
         {
           return errorCode;
@@ -1247,8 +1338,14 @@ namespace havCSON
           break;
         }
 
+        const LocationEntry keyLocation = Location();
         std::string key;
         ErrorCode errorCode = ParseKey(key);
+        if (errorCode != ErrorCode::OK)
+        {
+          return errorCode;
+        }
+        errorCode = CheckDuplicateKey(object, key, keyLocation);
         if (errorCode != ErrorCode::OK)
         {
           return errorCode;
@@ -1653,7 +1750,7 @@ namespace havCSON
     class LosslessParser : private Parser
     {
     public:
-      explicit LosslessParser(std::string_view src) : Parser(src)
+      explicit LosslessParser(std::string_view src, std::string_view filename = {}) : Parser(src, filename)
       {}
 
       ErrorCode Parse(LosslessValue& out, Error* error)
@@ -1744,6 +1841,21 @@ namespace havCSON
     private:
       std::vector<LosslessComment> mPendingComments;
 
+      std::string ReadInlineComment()
+      {
+        std::string comment;
+        if (!Match('#'))
+        {
+          return comment;
+        }
+        while (!EndOfFile() && Peek() != '\r' && Peek() != '\n')
+        {
+          comment.push_back(Get());
+        }
+        SkipToEOL();
+        return comment;
+      }
+
       ErrorCode Finish(ErrorCode errorCode, Error* error, std::optional<std::string_view> message = std::nullopt)
       {
         // Prefer existing detailed error (e.g., from base Fail) unless a new message is supplied
@@ -1752,12 +1864,14 @@ namespace havCSON
           mError.code = errorCode;
           mError.where = Location();
           mError.message.assign(message->data(), message->size());
+          mError.filename.assign(mFilename.begin(), mFilename.end());
         }
         else if (mError.code == ErrorCode::OK)
         {
           mError.code = errorCode;
           mError.where = Location();
           mError.message.clear();
+          mError.filename.assign(mFilename.begin(), mFilename.end());
         }
 
         if (error)
@@ -1767,6 +1881,7 @@ namespace havCSON
             error->code = errorCode;
             error->where = Location();
             error->message.assign(message->data(), message->size());
+            error->filename.assign(mFilename.begin(), mFilename.end());
           }
           else if (mError.code != ErrorCode::OK)
           {
@@ -1777,6 +1892,7 @@ namespace havCSON
             error->code = errorCode;
             error->where = Location();
             error->message.clear();
+            error->filename.assign(mFilename.begin(), mFilename.end());
           }
         }
         return errorCode;
@@ -1860,25 +1976,9 @@ namespace havCSON
           out.value = Array{};
           return ParseArrayLossless(out, currentIndent);
         }
-        if (c == '"')
+        if (c == '"' || c == '\'')
         {
-          Value tempValue;
-          ErrorCode errorCode = ParseStringOrTriple(tempValue);
-          if (errorCode == ErrorCode::OK)
-          {
-            out.value = std::move(tempValue);
-          }
-          return errorCode;
-        }
-        if (c == '\'')
-        {
-          Value tempValue;
-          ErrorCode errorCode = ParseStringSingle(tempValue);
-          if (errorCode == ErrorCode::OK)
-          {
-            out.value = std::move(tempValue);
-          }
-          return errorCode;
+          return ParseQuotedStringOrIndentedObjectLossless(out, currentIndent);
         }
         if (IsIdentifierStart(c))
         {
@@ -1901,19 +2001,195 @@ namespace havCSON
         return Finish(ErrorCode::UnexpectedChar, nullptr, "Unexpected character while parsing value");
       }
 
+      ErrorCode ParseQuotedStringOrIndentedObjectLossless(LosslessValue& out, int currentIndent)
+      {
+        const std::size_t savedPos = mPos;
+        const std::size_t savedLine = mLine;
+        const std::size_t savedColumn = mCol;
+        Value quotedValue;
+        ErrorCode errorCode = Peek() == '"' ? ParseStringOrTriple(quotedValue) : ParseStringSingle(quotedValue);
+        if (errorCode != ErrorCode::OK)
+        {
+          return errorCode;
+        }
+        SkipInlineSpaces();
+        if (Peek() != ':')
+        {
+          out.value = std::move(quotedValue);
+          return ErrorCode::OK;
+        }
+        mPos = savedPos;
+        mLine = savedLine;
+        mCol = savedColumn;
+        Object object;
+        errorCode = ParseIndentedObjectBodyLossless(object, out, currentIndent);
+        if (errorCode == ErrorCode::OK)
+        {
+          out.value = std::move(object);
+        }
+        return errorCode;
+      }
+
       ErrorCode ParseInlineObjectLossless(LosslessValue& out, int currentIndent)
       {
         if (!Match('{'))
         {
           return Finish(ErrorCode::InternalError, nullptr);
         }
+
         Object object;
+        SkipInlineSpaces();
+
+        const bool multiline = Peek() == '\r' || Peek() == '\n';
+        if (multiline)
+        {
+          char newline = Get();
+          if (newline == '\r' && Peek() == '\n')
+          {
+            Get();
+          }
+          bool hasLine = false;
+          ErrorCode errorCode = NextContentLineLossless(hasLine, mPendingComments);
+          if (errorCode != ErrorCode::OK)
+          {
+            return errorCode;
+          }
+          if (!hasLine)
+          {
+            return Finish(ErrorCode::UnexpectedEnd, nullptr, "Unterminated inline object");
+          }
+          if (Peek() == '}')
+          {
+            out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+            mPendingComments.clear();
+            Get();
+            out.value = std::move(object);
+            return ErrorCode::OK;
+          }
+
+          const int objectIndent = mIndentStack.back();
+          if (objectIndent <= currentIndent)
+          {
+            return Finish(ErrorCode::InconsistentIndent, nullptr, "Expected indented members inside object braces");
+          }
+
+          while (true)
+          {
+            if (Peek() == '}')
+            {
+              out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+              mPendingComments.clear();
+              Get();
+              break;
+            }
+
+            std::vector<LosslessComment> preKeyComments;
+            preKeyComments.swap(mPendingComments);
+            const LocationEntry keyLocation = Location();
+            std::string key;
+            errorCode = ParseKey(key);
+            if (errorCode != ErrorCode::OK)
+            {
+              return errorCode;
+            }
+            errorCode = CheckDuplicateKey(object, key, keyLocation);
+            if (errorCode != ErrorCode::OK)
+            {
+              return errorCode;
+            }
+            SkipInlineSpaces();
+            if (!Match(':'))
+            {
+              return Finish(ErrorCode::UnexpectedChar, nullptr, "Expected ':' in inline object");
+            }
+            SkipInlineSpaces();
+
+            LosslessValue child;
+            child.leadingComments = std::move(preKeyComments);
+            if (Peek() == '#')
+            {
+              child.blockComment = ReadInlineComment();
+            }
+            else if (Peek() == '\r' || Peek() == '\n')
+            {
+              newline = Get();
+              if (newline == '\r' && Peek() == '\n')
+              {
+                Get();
+              }
+            }
+
+            if (!child.blockComment.empty() || mCol == 1)
+            {
+              hasLine = false;
+              errorCode = NextContentLineLossless(hasLine, mPendingComments);
+              if (errorCode != ErrorCode::OK)
+              {
+                return errorCode;
+              }
+              if (!hasLine || mIndentStack.back() <= objectIndent)
+              {
+                return Finish(ErrorCode::InconsistentIndent, nullptr, "Expected an indented block value");
+              }
+              errorCode = ParseValueLossless(child, mIndentStack.back(), false);
+            }
+            else
+            {
+              errorCode = ParseValueLossless(child, objectIndent, false);
+            }
+            if (errorCode != ErrorCode::OK)
+            {
+              return errorCode;
+            }
+
+            out.objectItems.emplace_back(key, child);
+            object.emplace(std::move(key), child.value);
+
+            SkipInlineSpaces();
+            if (Peek() == '#')
+            {
+              out.objectItems.back().second.inlineComment = ReadInlineComment();
+            }
+            if (Match(','))
+            {
+              SkipInlineSpaces();
+            }
+            if (Peek() == '\r' || Peek() == '\n')
+            {
+              newline = Get();
+              if (newline == '\r' && Peek() == '\n')
+              {
+                Get();
+              }
+              hasLine = false;
+              errorCode = NextContentLineLossless(hasLine, mPendingComments);
+              if (errorCode != ErrorCode::OK)
+              {
+                return errorCode;
+              }
+              if (!hasLine)
+              {
+                return Finish(ErrorCode::UnexpectedEnd, nullptr, "Unterminated inline object");
+              }
+            }
+            if (mIndentStack.back() < objectIndent && Peek() != '}')
+            {
+              return Finish(ErrorCode::InconsistentIndent, nullptr, "Expected closing '}' for inline object");
+            }
+          }
+
+          out.value = std::move(object);
+          return ErrorCode::OK;
+        }
+
         SkipWhitespaceAndComments();
+
         if (Match('}'))
         {
           out.value = object;
           return ErrorCode::OK;
         }
+
         while (true)
         {
           // Comments collected before this key belong to this entry
@@ -1923,8 +2199,14 @@ namespace havCSON
             preKeyComments.swap(mPendingComments);
           }
 
+          const LocationEntry keyLocation = Location();
           std::string key;
           ErrorCode errorCode = ParseKey(key);
+          if (errorCode != ErrorCode::OK)
+          {
+            return errorCode;
+          }
+          errorCode = CheckDuplicateKey(object, key, keyLocation);
           if (errorCode != ErrorCode::OK)
           {
             return errorCode;
@@ -1988,6 +2270,8 @@ namespace havCSON
           {
             if (Peek() == ']')
             {
+              out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+              mPendingComments.clear();
               Get();
             }
             out.value = std::move(array);
@@ -1999,12 +2283,14 @@ namespace havCSON
           {
             if (Peek() == ']')
             {
+              out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+              mPendingComments.clear();
               Get();
               break;
             }
 
             LosslessValue child;
-            errorCode = ParseValueLossless(child, arrayIndent, false);
+            errorCode = ParseValueLossless(child, arrayIndent);
             if (errorCode != ErrorCode::OK)
             {
               return errorCode;
@@ -2016,7 +2302,7 @@ namespace havCSON
             if (Peek() == '#')
             {
               // If comment starts at current indent, treat as leading comment for next element
-              if (mCol <= arrayIndent + 1)
+              if (mCol <= static_cast<std::size_t>(arrayIndent + 1))
               {
                 std::string line;
                 Get(); // consume '#'
@@ -2116,6 +2402,8 @@ namespace havCSON
           // After loop, consume closing ] if present
           if (Peek() == ']')
           {
+            out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+            mPendingComments.clear();
             Get();
           }
         }
@@ -2252,8 +2540,14 @@ namespace havCSON
             preKeyComments.swap(mPendingComments);
           }
 
+          const LocationEntry keyLocation = Location();
           std::string key;
           ErrorCode errorCode = ParseKey(key);
+          if (errorCode != ErrorCode::OK)
+          {
+            return errorCode;
+          }
+          errorCode = CheckDuplicateKey(obj, key, keyLocation);
           if (errorCode != ErrorCode::OK)
           {
             return errorCode;
@@ -2278,9 +2572,10 @@ namespace havCSON
 
           if (blockValue)
           {
+            std::string blockComment;
             if (Peek() == '#')
             {
-              SkipToEOL();
+              blockComment = ReadInlineComment();
             }
             else
             {
@@ -2308,6 +2603,7 @@ namespace havCSON
             }
 
             LosslessValue child;
+            child.blockComment = std::move(blockComment);
             if (!preKeyComments.empty())
             {
               child.leadingComments.insert(child.leadingComments.end(), preKeyComments.begin(), preKeyComments.end());
@@ -2324,25 +2620,30 @@ namespace havCSON
 
             // After parsing block value, check if we need to advance to next line
             SkipInlineSpaces();
+            bool advanceToContent = false;
             if (Peek() == '#')
             {
-              SkipToEOL();
+              outWrapper.objectItems.back().second.inlineComment = ReadInlineComment();
+              advanceToContent = true;
             }
-            if (Peek() == '\r' || Peek() == '\n')
+            else if (Peek() == '\r' || Peek() == '\n')
             {
               char c2 = Get();
               if (c2 == '\r' && Peek() == '\n')
               {
                 Get();
               }
-
-              bool hasLine = false;
-              ErrorCode ec3 = NextContentLineLossless(hasLine, mPendingComments);
+              advanceToContent = true;
+            }
+            if (advanceToContent)
+            {
+              bool nextHasLine = false;
+              ErrorCode ec3 = NextContentLineLossless(nextHasLine, mPendingComments);
               if (ec3 != ErrorCode::OK)
               {
                 return ec3;
               }
-              if (!hasLine)
+              if (!nextHasLine)
               {
                 break;
               }
@@ -2373,7 +2674,7 @@ namespace havCSON
           if (Peek() == '#')
           {
             // If comment starts at current indent, treat as leading comment for next key
-            if (mCol <= bodyIndent + 1)
+            if (mCol <= static_cast<std::size_t>(bodyIndent + 1))
             {
               std::string line;
               Get();
@@ -2490,55 +2791,90 @@ namespace havCSON
     return losslessParser.Parse(out, error);
   }
 
-  inline ErrorCode ParseFile(const std::string& path, Value& out, Error* error = nullptr)
+  namespace detail
   {
-    auto fileStream = OpenFileUTF8(path, "rb");
-    if (!fileStream)
+    inline ErrorCode ReadFileUTF8(const std::string& path, std::string& data, Error* error)
     {
-      if (error)
+      auto fileStream = OpenFileUTF8(path, "rb");
+      if (!fileStream)
       {
-        error->code = ErrorCode::InternalError;
-        error->where = {};
-        error->message = "Failed to open file";
+        if (error)
+        {
+          error->code = ErrorCode::InternalError;
+          error->where = {};
+          error->message = "Failed to open file";
+          error->filename = path;
+        }
+        return ErrorCode::InternalError;
       }
-      return ErrorCode::InternalError;
-    }
-    if (std::fseek(fileStream.get(), 0, SEEK_END) != 0)
-    {
-      if (error)
-      {
-        error->code = ErrorCode::InternalError;
-        error->where = {};
-        error->message = "Failed to read file";
-      }
-      return ErrorCode::InternalError;
-    }
-    long size = std::ftell(fileStream.get());
-    if (size < 0 || std::fseek(fileStream.get(), 0, SEEK_SET) != 0)
-    {
-      if (error)
-      {
-        error->code = ErrorCode::InternalError;
-        error->where = {};
-        error->message = "Failed to read file";
-      }
-      return ErrorCode::InternalError;
-    }
-    std::string data(static_cast<std::size_t>(size), '\0');
-    if (!data.empty())
-    {
-      if (std::fread(&data[0], 1, static_cast<std::size_t>(size), fileStream.get()) != static_cast<std::size_t>(size))
+      if (std::fseek(fileStream.get(), 0, SEEK_END) != 0)
       {
         if (error)
         {
           error->code = ErrorCode::InternalError;
           error->where = {};
           error->message = "Failed to read file";
+          error->filename = path;
         }
         return ErrorCode::InternalError;
       }
+      const long size = std::ftell(fileStream.get());
+      if (size < 0 || std::fseek(fileStream.get(), 0, SEEK_SET) != 0)
+      {
+        if (error)
+        {
+          error->code = ErrorCode::InternalError;
+          error->where = {};
+          error->message = "Failed to read file";
+          error->filename = path;
+        }
+        return ErrorCode::InternalError;
+      }
+      data.assign(static_cast<std::size_t>(size), '\0');
+      if (!data.empty())
+      {
+        if (std::fread(data.data(), 1, static_cast<std::size_t>(size), fileStream.get()) != static_cast<std::size_t>(size))
+        {
+          if (error)
+          {
+            error->code = ErrorCode::InternalError;
+            error->where = {};
+            error->message = "Failed to read file";
+            error->filename = path;
+          }
+          return ErrorCode::InternalError;
+        }
+      }
+      if (error)
+      {
+        *error = {};
+      }
+      return ErrorCode::OK;
     }
-    return Parse(std::string_view(data), out, error);
+  } // namespace detail
+
+  inline ErrorCode ParseFile(const std::string& path, Value& out, Error* error = nullptr)
+  {
+    std::string data;
+    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error);
+    if (readResult != ErrorCode::OK)
+    {
+      return readResult;
+    }
+    Parser parser(std::string_view(data), path);
+    return parser.Parse(out, error);
+  }
+
+  inline ErrorCode ParseFileLossless(const std::string& path, LosslessValue& out, Error* error = nullptr)
+  {
+    std::string data;
+    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error);
+    if (readResult != ErrorCode::OK)
+    {
+      return readResult;
+    }
+    detail::LosslessParser losslessParser(std::string_view(data), path);
+    return losslessParser.Parse(out, error);
   }
 
   // Exception type and throwing wrappers
@@ -2570,6 +2906,18 @@ namespace havCSON
     Value value;
     Error error;
     ErrorCode errorCode = ParseFile(path, value, &error);
+    if (errorCode != ErrorCode::OK)
+    {
+      throw ParseException(error);
+    }
+    return value;
+  }
+
+  inline LosslessValue ParseLosslessOrThrow(std::string_view src)
+  {
+    LosslessValue value;
+    Error error;
+    const ErrorCode errorCode = ParseLossless(src, value, &error);
     if (errorCode != ErrorCode::OK)
     {
       throw ParseException(error);
@@ -2652,27 +3000,47 @@ namespace havCSON
       out.push_back('"');
     }
 
+    inline bool CanWriteKeyWithoutQuotes(std::string_view key)
+    {
+      const auto isStart = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+      };
+      const auto isContinue = [&](char c) {
+        return isStart(c) || (c >= '0' && c <= '9') || c == '-';
+      };
+      if (key.empty() || !isStart(key.front()))
+      {
+        return false;
+      }
+      return std::all_of(key.begin(), key.end(), isContinue);
+    }
+
+    inline void WriteKey(std::string_view key, std::string& out)
+    {
+      if (CanWriteKeyWithoutQuotes(key))
+      {
+        out.append(key);
+      }
+      else
+      {
+        WriteStringQuoted(key, out);
+      }
+    }
+
     inline std::string FormatNumber(double value)
     {
-      std::string result = std::to_string(value);
-      const std::size_t dot = result.find('.');
-      if (dot == std::string::npos)
+      std::array<char, 128> buffer{};
+      const auto result = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::general);
+      if (result.ec != std::errc{})
       {
-        return result;
+        return {};
       }
-      std::size_t trimEnd = result.size(); // Erase from here after trimming trailing zeros
-      while (trimEnd > dot + 1 && result[trimEnd - 1] == '0')
+      std::string text(buffer.data(), result.ptr);
+      if (text.find_first_of(".eE") == std::string::npos)
       {
-        --trimEnd;
+        text += ".0";
       }
-      if (trimEnd == dot + 1)
-      {
-        result.erase(dot + 1);
-        result.push_back('0');
-        return result;
-      }
-      result.erase(trimEnd);
-      return result;
+      return text;
     }
 
     inline bool ValidateFiniteNumbers(const Value& value, Error* error)
@@ -2846,35 +3214,7 @@ namespace havCSON
           {
             out += ", ";
           }
-          bool bareOK = true;
-          if (key.empty())
-          {
-            bareOK = false;
-          }
-          else
-          {
-            char c0 = key[0];
-            if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_'))
-            {
-              bareOK = false;
-            }
-            for (char c : key)
-            {
-              if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
-              {
-                bareOK = false;
-                break;
-              }
-            }
-          }
-          if (bareOK)
-          {
-            out += key;
-          }
-          else
-          {
-            WriteStringQuoted(key, out);
-          }
+          WriteKey(key, out);
           out += ": ";
           WriteValueInline(value, out, options);
         }
@@ -2912,37 +3252,7 @@ namespace havCSON
         }
         first = false;
 
-        // Key
-        bool bareOK = true;
-        if (key.empty())
-        {
-          bareOK = false;
-        }
-        else
-        {
-          char c0 = key[0];
-          if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_'))
-          {
-            bareOK = false;
-          }
-          for (char c : key)
-          {
-            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
-            {
-              bareOK = false;
-              break;
-            }
-          }
-        }
-
-        if (bareOK)
-        {
-          out += key;
-        }
-        else
-        {
-          WriteStringQuoted(key, out);
-        }
+        WriteKey(key, out);
 
         out += ": ";
 
@@ -3121,148 +3431,174 @@ namespace havCSON
 
   namespace detail
   {
-    inline void WriteCommentLines(const std::vector<LosslessComment>& lines, std::string& out, const WriteOptions& options)
+    inline void EnsureNewline(std::string& out)
     {
-      bool prevNonEmpty = false;
+      if (!out.empty() && out.back() != '\n')
+      {
+        out.push_back('\n');
+      }
+    }
+
+    inline void WriteCommentLines(const std::vector<LosslessComment>& lines, std::string& out)
+    {
       for (const auto& line : lines)
       {
-        if (prevNonEmpty && !line.text.empty())
+        if (!line.text.empty())
         {
-          out.push_back('\n');
+          WriteIndent(out, std::max(line.indent, 0), 1);
+          out.append(line.text);
         }
-        if (line.text.empty())
+        out.push_back('\n');
+      }
+    }
+
+    inline void WriteInlineComment(std::string_view comment, std::string& out)
+    {
+      while (!comment.empty() && (comment.back() == ' ' || comment.back() == '\t'))
+      {
+        comment.remove_suffix(1);
+      }
+      if (!comment.empty())
+      {
+        out.append(" #");
+        out.append(comment);
+      }
+    }
+
+    inline void WriteTrailingComments(const LosslessValue& value, std::string& out)
+    {
+      if (!value.trailingComments.empty())
+      {
+        EnsureNewline(out);
+        WriteCommentLines(value.trailingComments, out);
+      }
+    }
+
+    inline void WriteLosslessValue(
+      const LosslessValue& value,
+      std::string& out,
+      int indentLevel,
+      const WriteOptions& options,
+      WriteContext ctx,
+      bool emitLeadingComments = true);
+
+    inline void WriteLosslessMembers(
+      const std::vector<std::pair<std::string, LosslessValue>>& members,
+      std::string& out,
+      int indentLevel,
+      const WriteOptions& options)
+    {
+      const auto items = OrderedLosslessItems(members, options.sortObjectKeys);
+      bool first = true;
+      for (const auto& [key, childPtr] : items)
+      {
+        const LosslessValue& child = *childPtr;
+        if (!first)
         {
+          EnsureNewline(out);
+        }
+        first = false;
+
+        if (!child.leadingComments.empty())
+        {
+          WriteCommentLines(child.leadingComments, out);
+        }
+        WriteIndent(out, indentLevel, options.indentWidth);
+        WriteKey(key, out);
+        out.push_back(':');
+
+        const bool isContainer = std::holds_alternative<Array>(child.value) || std::holds_alternative<Object>(child.value);
+        if (isContainer)
+        {
+          WriteInlineComment(child.blockComment, out);
           out.push_back('\n');
-          prevNonEmpty = false;
+          WriteLosslessValue(child, out, indentLevel + 1, options, WriteContext::InObject, false);
         }
         else
         {
-          WriteIndent(out, line.indent, 1); // Indent is absolute columns
-          out.append(line.text);
-          out.push_back('\n');
-          prevNonEmpty = true;
+          out.push_back(' ');
+          WriteValue(child.value, out, indentLevel, options, WriteContext::InObject);
+          WriteInlineComment(child.inlineComment, out);
+          WriteTrailingComments(child, out);
         }
       }
     }
 
-    inline void
-    WriteLosslessValue(const LosslessValue& value, std::string& out, int indentLevel, const WriteOptions& options, WriteContext ctx)
+    inline void WriteLosslessValue(
+      const LosslessValue& value,
+      std::string& out,
+      int indentLevel,
+      const WriteOptions& options,
+      WriteContext ctx,
+      bool emitLeadingComments)
     {
-      WriteCommentLines(value.leadingComments, out, options);
-
-      auto trimTrailingSpaces = [](std::string& value) {
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
-        {
-          value.pop_back();
-        }
-      };
-
-      auto writeInlineComment = [&](const std::string& value) {
-        if (!value.empty())
-        {
-          out.append(" #");
-          out.append(value);
-        }
-      };
+      if (emitLeadingComments && !value.leadingComments.empty())
+      {
+        WriteCommentLines(value.leadingComments, out);
+      }
 
       if (std::holds_alternative<Array>(value.value) && !value.arrayItems.empty())
       {
         WriteIndent(out, indentLevel, options.indentWidth);
         out.append("[\n");
-        for (std::size_t index = 0; index < value.arrayItems.size(); ++index)
+        for (const auto& child : value.arrayItems)
         {
-          const LosslessValue& child = value.arrayItems[index];
           WriteLosslessValue(child, out, indentLevel + 1, options, WriteContext::InArray);
-          if (index + 1 < value.arrayItems.size())
-          {
-            out.push_back('\n');
-          }
+          EnsureNewline(out);
         }
-        out.push_back('\n');
+        WriteCommentLines(value.closingComments, out);
         WriteIndent(out, indentLevel, options.indentWidth);
         out.push_back(']');
+        WriteInlineComment(value.inlineComment, out);
+        WriteTrailingComments(value, out);
         return;
       }
 
       if (std::holds_alternative<Object>(value.value) && !value.objectItems.empty())
       {
-        auto items = OrderedLosslessItems(value.objectItems, options.sortObjectKeys);
-        // Use braces only in array context, otherwise use indent-style
-        if (ctx == WriteContext::InArray)
+        const bool useBraces =
+          ctx == WriteContext::InArray || !value.inlineComment.empty() || !value.closingComments.empty();
+        if (useBraces)
         {
-          // Inline braced format for objects in arrays
+          WriteIndent(out, indentLevel, options.indentWidth);
           out.append("{\n");
-          for (std::size_t index = 0; index < items.size(); ++index)
-          {
-            const auto& [key, childPtr] = items[index];
-            const LosslessValue& child = *childPtr;
-            WriteCommentLines(child.leadingComments, out, options);
-            WriteIndent(out, indentLevel + 1, options.indentWidth);
-            out.append(key);
-            out.append(": ");
-            WriteValue(child.value, out, indentLevel + 1, options, WriteContext::InObject);
-            writeInlineComment(child.inlineComment);
-            if (index + 1 < items.size())
-            {
-              out.push_back('\n');
-            }
-          }
-          out.push_back('\n');
+          WriteLosslessMembers(value.objectItems, out, indentLevel + 1, options);
+          EnsureNewline(out);
+          WriteCommentLines(value.closingComments, out);
           WriteIndent(out, indentLevel, options.indentWidth);
           out.push_back('}');
+          WriteInlineComment(value.inlineComment, out);
         }
         else
         {
-          // Indent-style format for regular objects
-          for (std::size_t index = 0; index < items.size(); ++index)
-          {
-            const auto& [key, childPtr] = items[index];
-            const LosslessValue& child = *childPtr;
-
-            // Write leading comments for this key (includes blanks)
-            WriteCommentLines(child.leadingComments, out, options);
-
-            WriteIndent(out, indentLevel, options.indentWidth);
-            out.append(key);
-            out.append(":");
-
-            // Determine if value should be on next line
-            bool isObject = std::holds_alternative<Object>(child.value);
-            bool isArray = std::holds_alternative<Array>(child.value);
-
-            if (isObject || isArray)
-            {
-              out.push_back('\n');
-              // For nested objects / arrays, don't write their leading comments again (they were already written above
-              // as comments for this key)
-              std::vector<LosslessComment> savedComments = child.leadingComments;
-              const_cast<LosslessValue&>(child).leadingComments.clear();
-              WriteLosslessValue(child, out, indentLevel + 1, options, WriteContext::InObject);
-              const_cast<LosslessValue&>(child).leadingComments = std::move(savedComments);
-            }
-            else
-            {
-              out.push_back(' ');
-              WriteValue(child.value, out, indentLevel, options, WriteContext::InObject);
-            }
-
-            // Trim trailing spaces from inline comments
-            std::string comment = child.inlineComment;
-            trimTrailingSpaces(comment);
-            writeInlineComment(comment);
-
-            if (index + 1 < items.size())
-            {
-              out.push_back('\n');
-            }
-          }
+          WriteLosslessMembers(value.objectItems, out, indentLevel, options);
         }
+        WriteTrailingComments(value, out);
         return;
       }
 
-      WriteIndent(out, indentLevel, options.indentWidth);
-      WriteValue(value.value, out, indentLevel, options, ctx);
-      writeInlineComment(value.inlineComment);
+      const bool isObjectInArray = ctx == WriteContext::InArray && std::holds_alternative<Object>(value.value);
+      if (isObjectInArray)
+      {
+        WriteIndent(out, indentLevel, options.indentWidth);
+        WriteValue(value.value, out, indentLevel, options, ctx);
+      }
+      else if (std::holds_alternative<Object>(value.value))
+      {
+        WriteValue(value.value, out, indentLevel, options, ctx);
+      }
+      else if (std::holds_alternative<Array>(value.value))
+      {
+        WriteIndent(out, indentLevel, options.indentWidth);
+        WriteValue(value.value, out, indentLevel, options, WriteContext::InArray);
+      }
+      else
+      {
+        WriteIndent(out, indentLevel, options.indentWidth);
+        WriteValue(value.value, out, indentLevel, options, ctx);
+      }
+      WriteInlineComment(value.inlineComment, out);
+      WriteTrailingComments(value, out);
     }
   } // namespace detail
 
@@ -3292,81 +3628,433 @@ namespace havCSON
     return result;
   }
 
-  inline bool WriteFile(const std::string& path, const Value& value, const WriteOptions& options = {}, Error* error = nullptr)
+  namespace detail
   {
-    auto fileStream = OpenFileUTF8(path, "wb");
-    if (!fileStream)
+    inline bool SetFileError(Error* error, std::string_view message)
     {
       if (error)
       {
         error->code = ErrorCode::InternalError;
         error->where = {};
-        error->message = "Failed to open file for writing";
+        error->message.assign(message.begin(), message.end());
       }
       return false;
     }
+
+    inline bool WriteFileContents(const std::string& path, std::string_view contents, Error* error)
+    {
+      auto fileStream = OpenFileUTF8(path, "wb");
+      if (!fileStream)
+      {
+        return SetFileError(error, "Failed to open file for writing");
+      }
+
+      std::size_t offset = 0;
+      while (offset < contents.size())
+      {
+        const std::size_t written = std::fwrite(contents.data() + offset, 1, contents.size() - offset, fileStream.get());
+        if (written == 0)
+        {
+          return SetFileError(error, "Failed to write file");
+        }
+        offset += written;
+      }
+      if (std::fflush(fileStream.get()) != 0)
+      {
+        return SetFileError(error, "Failed to flush file");
+      }
+
+      std::FILE* rawFile = fileStream.release();
+      if (std::fclose(rawFile) != 0)
+      {
+        return SetFileError(error, "Failed to close file");
+      }
+      if (error)
+      {
+        *error = {};
+      }
+      return true;
+    }
+  } // namespace detail
+
+  inline bool WriteFile(const std::string& path, const Value& value, const WriteOptions& options = {}, Error* error = nullptr)
+  {
     std::string stringValue;
     if (!ToString(value, stringValue, options, error))
     {
       return false;
     }
-    if (!stringValue.empty())
-    {
-      if (std::fwrite(stringValue.data(), 1, stringValue.size(), fileStream.get()) != stringValue.size())
-      {
-        if (error)
-        {
-          error->code = ErrorCode::InternalError;
-          error->where = {};
-          error->message = "Failed to write file";
-        }
-        return false;
-      }
-    }
-    if (error)
-    {
-      *error = {};
-    }
-    return true;
+    return detail::WriteFileContents(path, stringValue, error);
   }
 
-  inline bool
-  WriteFileLossless(const std::string& path, const LosslessValue& value, const WriteOptions& options = {}, Error* error = nullptr)
+  inline bool WriteFileLossless(const std::string& path, const LosslessValue& value, const WriteOptions& options = {}, Error* error = nullptr)
   {
-    auto fileStream = OpenFileUTF8(path, "wb");
-    if (!fileStream)
-    {
-      if (error)
-      {
-        error->code = ErrorCode::InternalError;
-        error->where = {};
-        error->message = "Failed to open file for writing";
-      }
-      return false;
-    }
     std::string stringValue;
     if (!ToStringLossless(value, stringValue, options, error))
     {
       return false;
     }
-    if (!stringValue.empty())
+    return detail::WriteFileContents(path, stringValue, error);
+  }
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+  // Test-only atomic-write failure injection
+  namespace testing
+  {
+    enum class AtomicWriteStage : std::uint8_t
     {
-      if (std::fwrite(stringValue.data(), 1, stringValue.size(), fileStream.get()) != stringValue.size())
+      None,
+      TemporaryOpen,
+      Write,
+      Flush,
+      Sync,
+      Close,
+      Replace,
+    };
+
+    inline thread_local AtomicWriteStage AtomicWriteFailureStage = AtomicWriteStage::None;
+
+    inline void FailAtomicWriteAt(AtomicWriteStage stage)
+    {
+      AtomicWriteFailureStage = stage;
+    }
+  } // namespace testing
+#endif
+
+  namespace detail
+  {
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+    inline bool ShouldFailAtomicWrite(testing::AtomicWriteStage stage)
+    {
+      return testing::AtomicWriteFailureStage == stage;
+    }
+#endif
+
+    inline std::string AtomicTemporaryPath(
+      const std::string& destination,
+      std::uint64_t uniqueSequence,
+      unsigned int attempt)
+    {
+#ifdef _WIN32
+      const auto processId = static_cast<unsigned long long>(GetCurrentProcessId());
+#else
+      const auto processId = static_cast<unsigned long long>(::getpid());
+#endif
+      return destination + ".tmp." + std::to_string(processId) + "." +
+             std::to_string(uniqueSequence) + "." + std::to_string(attempt);
+    }
+
+#ifdef _WIN32
+    inline bool WriteTextFileAtomicImpl(const std::string& path, std::string_view contents, Error* error)
+    {
+      static volatile LONG nextUniqueSequence = 0;
+      const std::uint64_t uniqueSequence = static_cast<std::uint32_t>(InterlockedIncrement(&nextUniqueSequence));
+      std::wstring temporaryPath;
+      HANDLE file = INVALID_HANDLE_VALUE;
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::TemporaryOpen))
       {
-        if (error)
+        return SetFileError(error, "Simulated atomic temporary-file open failure");
+      }
+#endif
+
+      for (unsigned int attempt = 0; attempt < 128; ++attempt)
+      {
+        temporaryPath = ConvertStringToWString(AtomicTemporaryPath(path, uniqueSequence, attempt), true);
+        if (temporaryPath.empty())
         {
-          error->code = ErrorCode::InternalError;
-          error->where = {};
-          error->message = "Failed to write file";
+          return SetFileError(error, "Invalid UTF-8 atomic temporary-file path");
         }
+        file = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE)
+        {
+          break;
+        }
+        const DWORD openError = GetLastError();
+        if (openError != ERROR_FILE_EXISTS && openError != ERROR_ALREADY_EXISTS)
+        {
+          return SetFileError(error, "Failed to create atomic temporary file");
+        }
+      }
+      if (file == INVALID_HANDLE_VALUE)
+      {
+        return SetFileError(error, "Failed to allocate a unique atomic temporary file");
+      }
+
+      auto fail = [&](std::string_view message) {
+        if (file != INVALID_HANDLE_VALUE)
+        {
+          CloseHandle(file);
+          file = INVALID_HANDLE_VALUE;
+        }
+        DeleteFileW(temporaryPath.c_str());
+        return SetFileError(error, message);
+      };
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Write))
+      {
+        return fail("Simulated atomic write failure");
+      }
+#endif
+
+      std::size_t offset = 0;
+
+      while (offset < contents.size())
+      {
+        const std::size_t remaining = contents.size() - offset;
+        const DWORD chunk = static_cast<DWORD>(std::min(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+        DWORD written = 0;
+        if (!::WriteFile(file, contents.data() + offset, chunk, &written, nullptr) || written == 0)
+        {
+          return fail("Failed to write atomic temporary file");
+        }
+        offset += static_cast<std::size_t>(written);
+      }
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Flush))
+      {
+        return fail("Simulated atomic flush failure");
+      }
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Sync))
+      {
+        return fail("Simulated atomic sync failure");
+      }
+#endif
+      if (!FlushFileBuffers(file))
+      {
+        return fail("Failed to flush atomic temporary file");
+      }
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Close))
+      {
+        return fail("Simulated atomic close failure");
+      }
+#endif
+      if (!CloseHandle(file))
+      {
+        file = INVALID_HANDLE_VALUE;
+        DeleteFileW(temporaryPath.c_str());
+        return SetFileError(error, "Failed to close atomic temporary file");
+      }
+      file = INVALID_HANDLE_VALUE;
+
+      const std::wstring destinationPath = ConvertStringToWString(path, true);
+      if (destinationPath.empty())
+      {
+        DeleteFileW(temporaryPath.c_str());
+        return SetFileError(error, "Invalid UTF-8 destination path");
+      }
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Replace))
+      {
+        DeleteFileW(temporaryPath.c_str());
+        return SetFileError(error, "Simulated atomic replacement failure");
+      }
+#endif
+      if (!MoveFileExW(
+            temporaryPath.c_str(), destinationPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+      {
+        DeleteFileW(temporaryPath.c_str());
+        return SetFileError(error, "Failed to atomically replace destination file");
+      }
+      if (error)
+      {
+        *error = {};
+      }
+      return true;
+    }
+#else
+    inline bool SyncContainingDirectory(const std::string& path, Error* error)
+    {
+      const std::size_t slash = path.find_last_of('/');
+      const std::string directory = slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+      int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+      flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+      flags |= O_CLOEXEC;
+#endif
+      const int directoryFile = ::open(directory.c_str(), flags);
+      if (directoryFile < 0)
+      {
+        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be opened for sync");
+      }
+      const bool synced = ::fsync(directoryFile) == 0;
+      const bool closed = ::close(directoryFile) == 0;
+      if (!synced || !closed)
+      {
+        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be synced");
+      }
+      return true;
+    }
+
+    inline bool WriteTextFileAtomicImpl(const std::string& path, std::string_view contents, Error* error)
+    {
+      static std::atomic<std::uint64_t> nextUniqueSequence{0};
+      const std::uint64_t uniqueSequence = nextUniqueSequence.fetch_add(1, std::memory_order_relaxed);
+      std::string temporaryPath;
+      int file = -1;
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::TemporaryOpen))
+      {
+        return SetFileError(error, "Simulated atomic temporary-file open failure");
+      }
+#endif
+
+      for (unsigned int attempt = 0; attempt < 128; ++attempt)
+      {
+        temporaryPath = AtomicTemporaryPath(path, uniqueSequence, attempt);
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        file = ::open(temporaryPath.c_str(), flags, static_cast<mode_t>(0666));
+        if (file >= 0)
+        {
+          break;
+        }
+        if (errno != EEXIST)
+        {
+          return SetFileError(error, "Failed to create atomic temporary file");
+        }
+      }
+      if (file < 0)
+      {
+        return SetFileError(error, "Failed to allocate a unique atomic temporary file");
+      }
+
+      auto fail = [&](std::string_view message) {
+        if (file >= 0)
+        {
+          ::close(file);
+          file = -1;
+        }
+        ::unlink(temporaryPath.c_str());
+        return SetFileError(error, message);
+      };
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Write))
+      {
+        return fail("Simulated atomic write failure");
+      }
+#endif
+
+      std::size_t offset = 0;
+
+      while (offset < contents.size())
+      {
+        const std::size_t chunk = std::min(contents.size() - offset, static_cast<std::size_t>(std::numeric_limits<ssize_t>::max()));
+        const ssize_t written = ::write(file, contents.data() + offset, chunk);
+        if (written < 0 && errno == EINTR)
+        {
+          continue;
+        }
+        if (written <= 0)
+        {
+          return fail("Failed to write atomic temporary file");
+        }
+        offset += static_cast<std::size_t>(written);
+      }
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Flush))
+      {
+        return fail("Simulated atomic flush failure");
+      }
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Sync))
+      {
+        return fail("Simulated atomic sync failure");
+      }
+#endif
+      if (::fsync(file) != 0)
+      {
+        return fail("Failed to sync atomic temporary file");
+      }
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Close))
+      {
+        return fail("Simulated atomic close failure");
+      }
+#endif
+      if (::close(file) != 0)
+      {
+        file = -1;
+        ::unlink(temporaryPath.c_str());
+        return SetFileError(error, "Failed to close atomic temporary file");
+      }
+
+      file = -1;
+
+#ifdef HAVCSON_ENABLE_TEST_HOOKS
+      if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Replace))
+      {
+        ::unlink(temporaryPath.c_str());
+        return SetFileError(error, "Simulated atomic replacement failure");
+      }
+#endif
+      if (::rename(temporaryPath.c_str(), path.c_str()) != 0)
+      {
+        ::unlink(temporaryPath.c_str());
+        return SetFileError(error, "Failed to atomically replace destination file");
+      }
+      if (!SyncContainingDirectory(path, error))
+      {
         return false;
       }
+      if (error)
+      {
+        *error = {};
+      }
+      return true;
     }
-    if (error)
+#endif
+  } // namespace detail
+
+  // Writes the serialized text to a temporary file in the destination directory,
+  // flushes it to disk, and then replaces the destination file in one operation.
+  inline bool WriteTextFileAtomic(const std::string& path, std::string_view contents, Error* error = nullptr)
+  {
+    if (path.empty())
     {
-      *error = {};
+      return detail::SetFileError(error, "Destination path is empty");
     }
-    return true;
+    return detail::WriteTextFileAtomicImpl(path, contents, error);
+  }
+
+  inline bool WriteFileAtomic(
+    const std::string& path,
+    const Value& value,
+    const WriteOptions& options = {},
+    Error* error = nullptr)
+  {
+    std::string serialized;
+    if (!ToString(value, serialized, options, error))
+    {
+      return false;
+    }
+    return WriteTextFileAtomic(path, serialized, error);
+  }
+
+  inline bool WriteFileLosslessAtomic(
+    const std::string& path,
+    const LosslessValue& value,
+    const WriteOptions& options = {},
+    Error* error = nullptr)
+  {
+    std::string serialized;
+    if (!ToStringLossless(value, serialized, options, error))
+    {
+      return false;
+    }
+    return WriteTextFileAtomic(path, serialized, error);
   }
 
   // Simple JSON writer without pretty-printing
@@ -3437,7 +4125,7 @@ namespace havCSON
           const Object& object = std::get<Object>(value);
           out.push_back('{');
           bool first = true;
-          for (auto& [key, value] : object)
+          for (const auto& [key, childValue] : object)
           {
             if (!first)
             {
@@ -3446,7 +4134,7 @@ namespace havCSON
             first = false;
             JsonString(key, out);
             out.push_back(':');
-            Write(value, out);
+            Write(childValue, out);
           }
           out.push_back('}');
         }
