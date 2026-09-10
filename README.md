@@ -19,16 +19,21 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
   - Atomic file writers safely replace an existing file after the new contents are flushed
 - Error-code and optional throwing parse APIs, including lossless parsing helpers
 - Duplicate object keys are rejected with `ErrorCode::DuplicateKey`
+- Optional source locations for parsed values and object keys, in both normal and lossless mode
+- Checked value access with logical paths, source-aware diagnostics, and safe integer conversions
+- Configurable nesting-depth and input-size limits for both parser modes and file input
+- Structured file-I/O errors with the filename, operation, and underlying system error
 - Finite `double` values use round-trip-safe parsing and formatting
 - Convert parsed data to JSON text via `ToJsonString`
 - Pretty-print output with controllable indent width and optional key sorting
 - Comment-aware round trips preserve comments (including comments after `:` or before a closing delimiter), blank lines, and member ordering while regenerating normalized CSON
+- Transactional lossless editing keeps semantic values and ordered nodes synchronized with configurable comment handling
 - Unicode / UTF-8 support with validation
 - Compile-time version constants (`VersionMajor`, `VersionMinor`, `VersionPatch`, and `VersionString`)
 
 ## Getting Started
 
-This library requires C++23. The library should be cross-platform, but has only been tested under Windows so far.
+This library requires C++23. The library should be cross-platform, but has only been tested under Windows and Linux so far.
 
 ### Installation
 
@@ -86,6 +91,39 @@ if (code == ErrorCode::DuplicateKey)
 
 Duplicate keys are rejected in both normal and lossless parsing instead of silently replacing or ignoring a value.
 
+#### Track source locations for validation
+
+Source tracking is optional and disabled by default. Enable it when application-level validation needs to report where a value or key came from:
+
+```cpp
+using namespace havCSON;
+
+std::string source = "server:\n  port: \"not a number\"\n";
+ParseOptions options{.trackSourceLocations = true};
+Value config;
+Error error;
+if (Parse(source, config, &error, options) != ErrorCode::OK)
+{
+  std::cerr << error.message << "\n";
+  return;
+}
+
+const Value& port = config.asObject().at("server").asObject().at("port");
+if (!port.isNumber())
+{
+  const SourceInfo* location = port.Source();
+  const SourcePosition& position = location->valueSpan.begin;
+  std::cerr << "Expected a number at line " << position.line
+            << ", column " << position.column << "\n"; // Line 2, column 9
+}
+```
+
+The same final `ParseOptions` argument works with `ParseLossless`, `ParseFile`, and `ParseFileLossless`; throwing helpers take it after the input string or path. `LosslessValue::Source()` exposes the metadata of its semantic `value`. `Source()` returns `nullptr` when tracking is off or a node was created programmatically. Parse errors still include their usual location when tracking is off.
+
+`SourceInfo::valueSpan` describes the original value token or container, and `keySpan` is present for object members. Positions use zero-based UTF-8 byte offsets and one-based lines and byte columns; spans are half-open (`begin` is inclusive; `end` is exclusive). File helpers also retain an owned filename. Byte offsets include any leading UTF-8 BOM, but the first content byte after the BOM still starts at column 1. LF, CRLF, and CR each count as a single newline.
+
+Locations describe the original input, not subsequently edited or serialized text. Copying a node retains its original source locations; assigning a fresh `Value` removes that node's metadata. Use `ClearSourceLocations(value)` to clear a complete semantic or lossless tree after edits, or `value.ClearSource()` for one semantic node. Writers and value comparisons ignore locations. Tracking off avoids metadata and line-index allocations, although every `Value` still has a small metadata-pointer field.
+
 #### Write CSON file atomically
 
 Numbers are stored as `double`. Finite values are formatted so that writing and parsing them recovers the same value; the original numeric spelling is not retained.
@@ -118,6 +156,70 @@ if (!ToString(root, text, options, &error))
 ```
 
 `WriteFileAtomic` serializes to a temporary file in the destination directory, flushes it, and then replaces the destination. Use `WriteFile` for a direct write, `WriteTextFileAtomic` for text that is already serialized, or `WriteFileLosslessAtomic` for a `LosslessValue`.
+
+#### Limit input size and nesting
+
+```cpp
+using namespace havCSON;
+
+ParseOptions options{
+  .trackSourceLocations = true,
+  .maxDepth = 64,
+  .maxInputBytes = 4 * 1024 * 1024,
+};
+Value config;
+Error error;
+if (ParseFile("config.cson", config, &error, options) == ErrorCode::ResourceLimit)
+{
+  std::cerr << error.filename << ": " << error.message << "\n";
+}
+```
+
+The default maximum container depth is 256. A root object or array counts as depth 1. Input size is unlimited by default. Setting either limit to 0 disables that limit. The same options apply to string/file, normal/lossless, and throwing parse APIs. A failed parse leaves the output unchanged. File reads enforce the byte cap incrementally, including if the file grows while being read.
+
+#### Read checked values
+
+```cpp
+using namespace havCSON;
+
+Value config = ParseOrThrow("server: {port: 22}", {.trackSourceLocations = true});
+auto port = ValueView(config).Member("server").Member("port").AsInteger<unsigned>(1, 65535);
+if (!port)
+{
+  std::cerr << port.error().message << "\n";
+  if (port.error().source)
+  {
+    std::cerr << "Line " << port.error().source->valueSpan.begin.line << "\n";
+  }
+}
+```
+
+`ValueView` also provides `At(index)`, `AtPath(path)`, and typed access to nulls, booleans, numbers, strings, arrays, and objects. Navigation preserves the first error. Paths contain literal keys and array indices, so keys containing dots are not ambiguous. Views and returned references borrow the document; `AccessError` owns its diagnostic data. Integer conversions reject fractional, non-finite, and out-of-range values before casting. Numbers remain `double`: these checks do not recover precision already lost in a large numeric literal.
+
+#### Edit without losing comments
+
+```cpp
+using namespace havCSON;
+
+LosslessValue document = ParseLosslessOrThrow("# Server settings\nport: 21 # Connection port\n");
+LosslessDocumentEditor editor(document);
+Error error;
+if (!editor.RenameMember({}, "port", "connectionPort", &error) ||
+    !editor.ReplaceMember({}, "connectionPort", MakeLossless(Value{22.0}), &error))
+{
+  std::cerr << error.message << "\n";
+  return;
+}
+std::cout << ToStringLossless(document); // Keeps both comments and the member position
+```
+
+The editor supports member and array insertion, replacement, removal, and reordering. Edits validate and update a temporary tree before committing, synchronizing all ancestors. Existing nodes retain their original source locations. These are not recalculated after an edit. Use `MakeLossless` for newly constructed semantic values. `ValidateLosslessTree` detects inconsistent manual edits. `RebuildLosslessTree` explicitly rebuilds semantic values from ordered children.
+
+Paths use literal keys and zero-based array indices, such as `ValuePath{"servers", std::size_t{0}}`. An empty path (`{}`) selects the root. Replacements preserve comments, and removals preserve them by default. `LosslessEditOptions` controls removal and comment indentation policies. The document must outlive the editor. Reacquire borrowed views, pointers, and references to its children after a successful edit.
+
+#### Handle file errors
+
+File operations report `ErrorCode::IoError` separately from syntax errors and resource limits. `Error::filename` identifies the destination or input, `operation` identifies the failed step, and `systemError` retains the original native cause before cleanup. For example, test `error.systemError == std::errc::permission_denied` instead of searching the message text. Successful calls clear previous errors. Atomic failures before replacement preserve the old destination. A directory-sync failure after replacement reports that replacement already succeeded.
 
 #### Parse from a string and mutate the data
 

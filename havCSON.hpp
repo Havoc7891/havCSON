@@ -7,10 +7,21 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 
 REVISION HISTORY
 
-v0.4.0 (2026-08-13) - Added duplicate-key rejection, made finite double parsing and formatting round-trip-safe, fixed lossless parsing and writing, and added atomic file writers.
-v0.3.0 (2026-05-15) - Simplified platform type size checks.
-v0.2.0 (2026-01-18) - Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
-v0.1.0 (2025-12-15) - First release.
+v0.5.0 (2026-09-10)
+- Added optional source locations, safe lossless editing, parser resource limits, structured file errors, and source-aware checked access.
+- Fixed parser state resets, identifier rewinding, newline handling, and lossless round trips.
+
+v0.4.0 (2026-08-13)
+- Added duplicate-key rejection, made finite double parsing and formatting round-trip-safe, fixed lossless parsing and writing, and added atomic file writers.
+
+v0.3.0 (2026-05-15)
+- Simplified platform type size checks.
+
+v0.2.0 (2026-01-18)
+- Trimmed float output, non-finite numbers are rejected on write, added error-returning writer overloads.
+
+v0.1.0 (2025-12-15)
+- First release.
 
 LICENSE
 
@@ -78,6 +89,9 @@ SOFTWARE.
 #include <cmath>
 #include <cerrno>
 #include <exception>
+#include <expected>
+#include <concepts>
+#include <functional>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -86,6 +100,7 @@ SOFTWARE.
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -104,9 +119,9 @@ static_assert(CHAR_BIT == 8, "havCSON requires 8-bit bytes");
 namespace havCSON
 {
   inline constexpr std::uint32_t VersionMajor = 0;
-  inline constexpr std::uint32_t VersionMinor = 4;
+  inline constexpr std::uint32_t VersionMinor = 5;
   inline constexpr std::uint32_t VersionPatch = 0;
-  inline constexpr std::string_view VersionString = "0.4.0";
+  inline constexpr std::string_view VersionString = "0.5.0";
 
   struct FileCloser
   {
@@ -151,12 +166,27 @@ namespace havCSON
   inline FilePtr OpenFileUTF8(const std::string& path, const std::string& mode)
   {
     FilePtr fileStream;
+    if (path.find('\0') != std::string::npos || mode.find('\0') != std::string::npos)
+    {
+      errno = EINVAL;
+      return fileStream;
+    }
     std::wstring modeW = ConvertStringToWString(mode, true);
     std::wstring pathW = ConvertStringToWString(path, true);
+    if (modeW.empty() || pathW.empty())
+    {
+      errno = EILSEQ;
+      return fileStream;
+    }
     std::FILE* file = nullptr;
-    if (_wfopen_s(&file, pathW.c_str(), modeW.c_str()) == 0)
+    const auto result = _wfopen_s(&file, pathW.c_str(), modeW.c_str());
+    if (result == 0)
     {
       fileStream.reset(file);
+    }
+    else
+    {
+      errno = result;
     }
     return fileStream;
   }
@@ -164,6 +194,11 @@ namespace havCSON
   inline FilePtr OpenFileUTF8(const std::string& path, const std::string& mode)
   {
     FilePtr fileStream;
+    if (path.find('\0') != std::string::npos || mode.find('\0') != std::string::npos)
+    {
+      errno = EINVAL;
+      return fileStream;
+    }
     fileStream.reset(std::fopen(path.c_str(), mode.c_str()));
     return fileStream;
   }
@@ -173,6 +208,42 @@ namespace havCSON
   {
     std::size_t line = 1;
     std::size_t column = 1;
+  };
+
+  struct ParseOptions
+  {
+    bool trackSourceLocations = false;
+    // Container nesting includes the root object/array. Scalars have depth zero.
+    // Zero disables either limit. The input limit counts original UTF-8 bytes,
+    // including a BOM, and is checked before validation or source indexing.
+    std::size_t maxDepth = 256;
+    std::size_t maxInputBytes = 0;
+  };
+
+  // Offsets address the original UTF-8 bytes (including a BOM). Lines and byte
+  // columns are one-based. LF, CRLF, and CR each start a new line.
+  struct SourcePosition
+  {
+    std::size_t byteOffset = 0;
+    std::size_t line = 1;
+    std::size_t column = 1;
+
+    friend bool operator==(const SourcePosition&, const SourcePosition&) = default;
+  };
+
+  struct SourceSpan
+  {
+    SourcePosition begin;
+    SourcePosition end; // Exclusive
+
+    friend bool operator==(const SourceSpan&, const SourceSpan&) = default;
+  };
+
+  struct SourceInfo
+  {
+    SourceSpan valueSpan;
+    std::optional<SourceSpan> keySpan; // Present only for an object member
+    std::shared_ptr<const std::string> filename; // Owned - null for unnamed input
   };
 
   enum class ErrorCode : std::uint8_t
@@ -189,6 +260,13 @@ namespace havCSON
     InconsistentIndent,
     InternalError,
     DuplicateKey,
+    ResourceLimit,
+    IoError,
+    InvalidPath,
+    TypeMismatch,
+    InvalidLosslessTree,
+    OutOfRange,
+    MissingMember,
   };
 
   struct Error
@@ -197,6 +275,10 @@ namespace havCSON
     LocationEntry where{};
     std::string message;
     std::string filename;
+    // File failures retain their operation and native cause before cleanup.
+    // These remain empty for syntax, validation, and resource-limit errors.
+    std::string operation;
+    std::error_code systemError;
 
     explicit operator bool() const
     {
@@ -212,6 +294,19 @@ namespace havCSON
   struct Value : std::variant<std::nullptr_t, bool, double, std::string, Array, Object>
   {
     using variant::variant;
+
+    // Original source locations, not live positions in regenerated output.
+    // Copies retain them. Newly constructed values have none. Metadata is not
+    // part of semantic comparisons and is never serialized by a writer.
+    const SourceInfo* Source() const noexcept
+    {
+      return mSource.get();
+    }
+
+    void ClearSource() noexcept
+    {
+      mSource.reset();
+    }
 
     bool isNull() const
     {
@@ -262,6 +357,10 @@ namespace havCSON
     {
       return std::get<Object>(*this);
     }
+
+  private:
+    friend class Parser;
+    std::shared_ptr<SourceInfo> mSource;
   };
 
   // Optional lossless representation that can carry comments / ordering for regeneration
@@ -281,18 +380,452 @@ namespace havCSON
     std::vector<LosslessComment> trailingComments; // Comments / blank lines after this value (before dedent)
     std::string blockComment; // Comment after an object key's ':' before a block value
     std::vector<LosslessComment> closingComments; // Full-line comments immediately before a container's closing delimiter
+
+    const SourceInfo* Source() const noexcept
+    {
+      return value.Source();
+    }
+  };
+
+  inline void ClearSourceLocations(Value& value) noexcept
+  {
+    value.ClearSource();
+
+    if (value.isArray())
+    {
+      for (auto& child : value.asArray())
+      {
+        ClearSourceLocations(child);
+      }
+    }
+    else if (value.isObject())
+    {
+      for (auto& member : value.asObject())
+      {
+        ClearSourceLocations(member.second);
+      }
+    }
+  }
+
+  inline void ClearSourceLocations(LosslessValue& value) noexcept
+  {
+    ClearSourceLocations(value.value);
+
+    for (auto& child : value.arrayItems)
+    {
+      ClearSourceLocations(child);
+    }
+
+    for (auto& member : value.objectItems)
+    {
+      ClearSourceLocations(member.second);
+    }
+  }
+
+  // Paths own their keys. A string is always one literal object key, never a
+  // dot-separated expression. This also supports empty keys and keys with dots.
+  using ValuePathSegment = std::variant<std::string, std::size_t>;
+  using ValuePath = std::vector<ValuePathSegment>;
+
+  inline std::string FormatValuePath(const ValuePath& path)
+  {
+    std::string result = "$";
+    constexpr char hexDigits[] = "0123456789abcdef";
+
+    for (const auto& segment : path)
+    {
+      if (const auto* key = std::get_if<std::string>(&segment))
+      {
+        result += "[\"";
+
+        for (const unsigned char byte : *key)
+        {
+          switch (byte)
+          {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+              if (byte < 0x20)
+              {
+                result += "\\u00";
+                result += hexDigits[byte >> 4];
+                result += hexDigits[byte & 0x0f];
+              }
+              else
+              {
+                result += static_cast<char>(byte);
+              }
+              break;
+          }
+        }
+
+        result += "\"]";
+      }
+      else
+      {
+        result += '[';
+        result += std::to_string(std::get<std::size_t>(segment));
+        result += ']';
+      }
+    }
+
+    return result;
+  }
+
+  inline std::string_view ValueTypeName(const Value& value) noexcept
+  {
+    switch (value.index())
+    {
+      case 0: return "null";
+      case 1: return "boolean";
+      case 2: return "number";
+      case 3: return "string";
+      case 4: return "array";
+      case 5: return "object";
+      default: return "invalid value";
+    }
+  }
+
+  // Unlike a ValueView, this diagnostic owns all of its data. Source locations
+  // are copied, so the error remains useful after the document is destroyed.
+  struct AccessError
+  {
+    ErrorCode code = ErrorCode::TypeMismatch;
+    ValuePath path;
+    std::string message;
+    std::string expectedType;
+    std::string actualType;
+    std::optional<SourceInfo> source;
+    // Missing members and out-of-range indices refer to their parent value.
+    // Such errors never claim to know the source span of the missing child.
+    bool sourceIsContainer = false;
+  };
+
+  // A borrowed read-only cursor. The document must outlive the cursor and any
+  // reference returned by AsString/AsArray/AsObject/Get, and must not be mutated
+  // while these are used. Navigation retains the first error for easy chaining.
+  class ValueView
+  {
+  public:
+    explicit ValueView(const Value& value) noexcept : mValue(&value) {}
+    ValueView(Value&&) = delete;
+    ValueView(const Value&&) = delete;
+
+    const ValuePath& Path() const noexcept
+    {
+      return mPath;
+    }
+
+    bool HasValue() const noexcept
+    {
+      return !mError.has_value();
+    }
+
+    std::expected<std::reference_wrapper<const Value>, AccessError> Get() const
+    {
+      if (mError)
+      {
+        return std::unexpected(*mError);
+      }
+      return std::cref(*mValue);
+    }
+
+    ValueView Member(std::string_view key) const
+    {
+      if (mError)
+      {
+        return *this;
+      }
+
+      const auto* object = std::get_if<Object>(mValue);
+      if (!object)
+      {
+        return ValueView(TypeError("object"));
+      }
+
+      ValuePath path = mPath;
+      path.emplace_back(std::string(key));
+
+      const auto found = object->find(std::string(key));
+      if (found == object->end())
+      {
+        return ValueView(MakeError(ErrorCode::MissingMember, std::move(path),
+            "member", "missing", "required member is missing", true));
+      }
+
+      return ValueView(found->second, std::move(path));
+    }
+
+    ValueView At(std::size_t index) const
+    {
+      if (mError)
+      {
+        return *this;
+      }
+
+      const auto* array = std::get_if<Array>(mValue);
+      if (!array)
+      {
+        return ValueView(TypeError("array"));
+      }
+
+      ValuePath path = mPath;
+      path.emplace_back(index);
+
+      if (index >= array->size())
+      {
+        return ValueView(MakeError(ErrorCode::OutOfRange, std::move(path),
+            "array element", "missing", "array index is out of range (size " +
+            std::to_string(array->size()) + ')', true));
+      }
+
+      return ValueView((*array)[index], std::move(path));
+    }
+
+    // Resolve literal segments relative to this cursor - an empty path is a no-op
+    ValueView AtPath(const ValuePath& path) const
+    {
+      ValueView view = *this;
+
+      for (const auto& segment : path)
+      {
+        if (const auto* key = std::get_if<std::string>(&segment))
+        {
+          view = view.Member(*key);
+        }
+        else
+        {
+          view = view.At(std::get<std::size_t>(segment));
+        }
+
+        if (!view.HasValue())
+        {
+          break;
+        }
+      }
+
+      return view;
+    }
+
+    std::expected<std::nullptr_t, AccessError> AsNull() const
+    {
+      return ReadScalar<std::nullptr_t>("null");
+    }
+
+    std::expected<bool, AccessError> AsBool() const
+    {
+      return ReadScalar<bool>("boolean");
+    }
+
+    std::expected<double, AccessError> AsNumber() const
+    {
+      return ReadScalar<double>("number");
+    }
+
+    std::expected<std::reference_wrapper<const std::string>, AccessError> AsString() const
+    {
+      return ReadReference<std::string>("string");
+    }
+
+    std::expected<std::reference_wrapper<const Array>, AccessError> AsArray() const
+    {
+      return ReadReference<Array>("array");
+    }
+
+    std::expected<std::reference_wrapper<const Object>, AccessError> AsObject() const
+    {
+      return ReadReference<Object>("object");
+    }
+
+    // Numbers still have double semantics: this checks the stored number, not
+    // precision already lost before parsing. Store exact large IDs as strings.
+    template <std::integral Integer>
+      requires (!std::same_as<std::remove_cv_t<Integer>, bool> &&
+                std::same_as<Integer, std::remove_cv_t<Integer>>)
+    std::expected<Integer, AccessError> AsInteger() const
+    {
+      const auto number = AsNumber();
+
+      if (!number)
+      {
+        if (mError)
+        {
+          return std::unexpected(number.error());
+        }
+
+        return std::unexpected(TypeError("integer"));
+      }
+
+      if (!std::isfinite(*number) || std::trunc(*number) != *number)
+      {
+        return std::unexpected(MakeError(ErrorCode::InvalidNumber, mPath,
+            "integer", "number", "expected a finite integral number"));
+      }
+
+      // The upper bound is exclusive. Converting INT64_MAX or UINT64_MAX to
+      // double rounds them up, so a <= double(max) check would allow UB here.
+      constexpr int digits = std::numeric_limits<Integer>::digits;
+      const double upper = std::ldexp(1.0, digits);
+      const double lower = std::is_signed_v<Integer> ? -upper : 0.0;
+
+      if (*number < lower || *number >= upper)
+      {
+        return std::unexpected(MakeError(ErrorCode::OutOfRange, mPath,
+            "integer", "number", "number is outside the requested integer type's range"));
+      }
+
+      return static_cast<Integer>(*number);
+    }
+
+    template <std::integral Integer>
+      requires (!std::same_as<std::remove_cv_t<Integer>, bool> &&
+                std::same_as<Integer, std::remove_cv_t<Integer>>)
+    std::expected<Integer, AccessError> AsInteger(Integer minimum, Integer maximum) const
+    {
+      const auto integer = AsInteger<Integer>();
+
+      if (!integer)
+      {
+        return integer;
+      }
+
+      if (minimum > maximum || *integer < minimum || *integer > maximum)
+      {
+        return std::unexpected(MakeError(ErrorCode::OutOfRange, mPath,
+            "integer", "number", "number is outside the required range [" +
+            std::to_string(minimum) + ", " + std::to_string(maximum) + ']'));
+      }
+
+      return integer;
+    }
+
+  private:
+    ValueView(const Value& value, ValuePath path)
+      : mValue(&value), mPath(std::move(path)) {}
+
+    explicit ValueView(AccessError error)
+      : mValue(nullptr), mPath(error.path), mError(std::move(error)) {}
+
+    AccessError MakeError(ErrorCode code, ValuePath path, std::string expected,
+                          std::string actual, std::string detail,
+                          bool sourceIsContainer = false) const
+    {
+      AccessError error;
+      error.code = code;
+      error.path = std::move(path);
+      error.expectedType = std::move(expected);
+      error.actualType = std::move(actual);
+      error.message = FormatValuePath(error.path) + ": " + std::move(detail);
+      error.sourceIsContainer = sourceIsContainer;
+
+      if (mValue && mValue->Source())
+      {
+        error.source = *mValue->Source();
+
+        if (sourceIsContainer)
+        {
+          error.source->keySpan.reset();
+        }
+      }
+
+      return error;
+    }
+
+    AccessError TypeError(std::string expected) const
+    {
+      const std::string actual(ValueTypeName(*mValue));
+      const std::string detail = "expected " + expected + ", got " + actual;
+
+      return MakeError(ErrorCode::TypeMismatch, mPath, std::move(expected), actual, detail);
+    }
+
+    template <typename Type>
+    std::expected<Type, AccessError> ReadScalar(std::string_view expected) const
+    {
+      if (mError)
+      {
+        return std::unexpected(*mError);
+      }
+
+      if (const auto* value = std::get_if<Type>(mValue))
+      {
+        return *value;
+      }
+
+      return std::unexpected(TypeError(std::string(expected)));
+    }
+
+    template <typename Type>
+    std::expected<std::reference_wrapper<const Type>, AccessError>
+    ReadReference(std::string_view expected) const
+    {
+      if (mError)
+      {
+        return std::unexpected(*mError);
+      }
+
+      if (const auto* value = std::get_if<Type>(mValue))
+      {
+        return std::cref(*value);
+      }
+
+      return std::unexpected(TypeError(std::string(expected)));
+    }
+
+    const Value* mValue;
+    ValuePath mPath;
+    std::optional<AccessError> mError;
   };
 
   class Parser
   {
   public:
-    Parser(std::string_view src, std::string_view filename = {}) : mSrc(src), mFilename(filename)
-    {}
+    Parser(std::string_view src, std::string_view filename = {}, const ParseOptions& options = {})
+      : mSrc(src), mFilename(filename), mOptions(options)
+    {
+      if (mOptions.trackSourceLocations && !InputLimitExceeded())
+      {
+        if (!mFilename.empty())
+        {
+          mSourceFilename = std::make_shared<const std::string>(mFilename);
+        }
+
+        const bool bom = mSrc.starts_with("\xEF\xBB\xBF");
+
+        mSourceLineStarts.push_back(bom ? 3 : 0);
+
+        for (std::size_t offset = 0; offset < mSrc.size(); ++offset)
+        {
+          if (mSrc[offset] == '\r')
+          {
+            if (offset + 1 < mSrc.size() && mSrc[offset + 1] == '\n')
+            {
+              ++offset;
+            }
+
+            mSourceLineStarts.push_back(offset + 1);
+          }
+          else if (mSrc[offset] == '\n')
+          {
+            mSourceLineStarts.push_back(offset + 1);
+          }
+        }
+      }
+    }
 
     ErrorCode Parse(Value& out, Error* error = nullptr)
     {
-      // Reset previous error state for a fresh parse
-      mError = {};
+      ResetParseState();
+
+      if (InputLimitExceeded())
+      {
+        return Fail(ErrorCode::ResourceLimit, error, "Maximum input byte count exceeded");
+      }
 
       // Validate UTF-8 up front (strips leading BOM)
       std::size_t badIndex = 0;
@@ -334,6 +867,7 @@ namespace havCSON
             }
             else
             {
+              *error = {};
               error->code = errorCode;
               error->where = Location();
               error->message.clear();
@@ -395,6 +929,139 @@ namespace havCSON
     std::vector<int> mIndentStack{0}; // Known indent levels (columns)
 
     Error mError;
+    ParseOptions mOptions;
+    std::shared_ptr<const std::string> mSourceFilename;
+    std::vector<std::size_t> mSourceLineStarts;
+    std::optional<std::size_t> mArrayClosingEnd;
+    std::size_t mContainerDepth = 0;
+
+    struct ContainerDepthGuard
+    {
+      explicit ContainerDepthGuard(std::size_t& depth) : mDepth(depth) { ++mDepth; }
+      ~ContainerDepthGuard() { --mDepth; }
+      ContainerDepthGuard(const ContainerDepthGuard&) = delete;
+      ContainerDepthGuard& operator=(const ContainerDepthGuard&) = delete;
+
+    private:
+      std::size_t& mDepth;
+    };
+
+    bool InputLimitExceeded() const noexcept
+    {
+      return mOptions.maxInputBytes != 0 && mSrc.size() > mOptions.maxInputBytes;
+    }
+
+    bool CanEnterContainer()
+    {
+      if (mOptions.maxDepth != 0 && mContainerDepth >= mOptions.maxDepth)
+      {
+        Fail(ErrorCode::ResourceLimit, nullptr, "Maximum container nesting depth exceeded");
+        return false;
+      }
+
+      return true;
+    }
+
+    void ResetParseState()
+    {
+      mError = {};
+      mPos = 0;
+      mLine = mCol = 1;
+      mIndentUnit = 0;
+      mIndentStack.assign(1, 0);
+      mArrayClosingEnd.reset();
+      mContainerDepth = 0;
+    }
+
+    SourcePosition SourcePositionAt(std::size_t offset) const
+    {
+      if (!mOptions.trackSourceLocations)
+      {
+        return {};
+      }
+
+      const auto next = std::upper_bound(mSourceLineStarts.begin(), mSourceLineStarts.end(), offset);
+      const auto index = next == mSourceLineStarts.begin() ? 0 :
+        static_cast<std::size_t>(next - mSourceLineStarts.begin() - 1);
+      const auto start = mSourceLineStarts[index];
+
+      return {offset, index + 1, offset >= start ? offset - start + 1 : 1};
+    }
+
+    void RecordSource(Value& value, std::size_t begin)
+    {
+      if (!mOptions.trackSourceLocations)
+      {
+        return;
+      }
+
+      std::size_t end = mPos;
+
+      if ((value.isObject() && mSrc[begin] != '{') ||
+          (value.isArray() && !mArrayClosingEnd))
+      {
+        // Indentation parsing may already have consumed following comments or
+        // the next sibling's indentation. The final child, not the cursor,
+        // determines the end of a block value.
+        end = begin;
+        const auto include = [&end](const Value& child)
+        {
+          if (const auto* source = child.Source())
+          {
+            end = std::max(end, source->valueSpan.end.byteOffset);
+          }
+        };
+
+        if (value.isObject())
+        {
+          for (const auto& member : value.asObject())
+          {
+            include(member.second);
+          }
+        }
+        else
+        {
+          end = begin + 1; // Opening '[' of an empty multiline array
+          for (const auto& child : value.asArray())
+          {
+            include(child);
+          }
+        }
+      }
+      else if (value.isArray())
+      {
+        end = *mArrayClosingEnd;
+      }
+      else if (!value.isObject())
+      {
+        // Identifier/string lookahead consumes spaces while looking for ':'.
+        // Quoted literals end with their quote, so stripping exterior space
+        // never removes bytes belonging to their decoded string contents.
+        while (end > begin && (mSrc[end - 1] == ' ' || mSrc[end - 1] == '\t' ||
+                               mSrc[end - 1] == '\r' || mSrc[end - 1] == '\n'))
+        {
+          --end;
+        }
+      }
+
+      value.mSource = std::make_shared<SourceInfo>(SourceInfo{
+        {SourcePositionAt(begin), SourcePositionAt(end)}, std::nullopt, mSourceFilename});
+    }
+
+    void RecordKeySource(Value& value, const SourceSpan& key)
+    {
+      if (!mOptions.trackSourceLocations || !value.mSource)
+      {
+        return;
+      }
+
+      if (!value.mSource.unique())
+      {
+        value.mSource = std::make_shared<SourceInfo>(*value.mSource);
+      }
+
+      value.mSource->keySpan = key;
+    }
 
     char Peek() const
     {
@@ -413,12 +1080,12 @@ namespace havCSON
         return '\0';
       }
       char c = mSrc[mPos++];
-      if (c == '\n')
+      if (c == '\r' || (c == '\n' && (mPos < 2 || mSrc[mPos - 2] != '\r')))
       {
         ++mLine;
         mCol = 1;
       }
-      else
+      else if (c != '\n')
       {
         ++mCol;
       }
@@ -492,8 +1159,12 @@ namespace havCSON
       while (!EndOfFile())
       {
         char c = Get();
-        if (c == '\n')
+        if (c == '\r' || c == '\n')
         {
+          if (c == '\r' && Peek() == '\n')
+          {
+            Get();
+          }
           break;
         }
       }
@@ -570,7 +1241,10 @@ namespace havCSON
         if (c == '#')
         {
           SkipToEOL();
-          c = Peek();
+          // SkipToEOL already consumed this comment's line ending. Leave a
+          // following blank line for the next call so lossless parsing can
+          // retain it as a separate trivia item.
+          return ErrorCode::OK;
         }
         // Consume line ending (if any)
         if (c == '\r')
@@ -823,6 +1497,20 @@ namespace havCSON
     ErrorCode ParseValue(Value& out, int currentIndent)
     {
       SkipWhitespaceAndComments();
+
+      const auto begin = mPos;
+      const auto result = ParseValueBody(out, currentIndent);
+
+      if (result == ErrorCode::OK)
+      {
+        RecordSource(out, begin);
+      }
+
+      return result;
+    }
+
+    ErrorCode ParseValueBody(Value& out, int currentIndent)
+    {
       char c = Peek();
       if (c == '{')
       {
@@ -898,6 +1586,8 @@ namespace havCSON
     // Parse identifier or keywords true / false / null or an indent-style object
     ErrorCode parseIdentifierOrIndentedObject(Value& out, int currentIndent)
     {
+      const auto savedPos = mPos;
+      const auto savedColumn = mCol;
       std::string ident;
       while (IsIdentifierChar(Peek()))
       {
@@ -910,8 +1600,8 @@ namespace havCSON
         // Rewind to start of identifier and parse an indented object body.
         // We treat this as an object even at top-level.
         // Reset position so that parseObjectBody can re-read the key.
-        mPos -= ident.size();
-        mCol -= ident.size();
+        mPos = savedPos;
+        mCol = savedColumn;
         Object object;
         ErrorCode errorCode = ParseIndentedObjectBody(object, currentIndent);
         if (errorCode != ErrorCode::OK)
@@ -1229,6 +1919,11 @@ namespace havCSON
 
     ErrorCode ParseInlineObject(Value& out, int currentIndent)
     {
+      if (!CanEnterContainer())
+      {
+        return ErrorCode::ResourceLimit;
+      }
+      const ContainerDepthGuard depthGuard(mContainerDepth);
       if (!Match('{'))
       {
         return Fail(ErrorCode::InternalError, nullptr);
@@ -1244,7 +1939,8 @@ namespace havCSON
       {
         const LocationEntry keyLocation = Location();
         std::string key;
-        ErrorCode errorCode = ParseKey(key);
+        SourceSpan keySource;
+        ErrorCode errorCode = ParseKey(key, &keySource);
         if (errorCode != ErrorCode::OK)
         {
           return errorCode;
@@ -1266,6 +1962,7 @@ namespace havCSON
         {
           return errorCode;
         }
+        RecordKeySource(value, keySource);
         object.emplace(std::move(key), std::move(value));
         SkipWhitespaceAndComments();
         if (Match('}'))
@@ -1294,6 +1991,11 @@ namespace havCSON
 
     ErrorCode ParseIndentedObjectBody(Object& object, int parentIndent)
     {
+      if (!CanEnterContainer())
+      {
+        return ErrorCode::ResourceLimit;
+      }
+      const ContainerDepthGuard depthGuard(mContainerDepth);
       // We assume we're currently on the line that already has the first key at indent == mIndentStack.back() (>=
       // parentIndent). The object spans lines at the current indent; deeper indents belong to child values.
       int bodyIndent = -1; // Will be set after parsing first key
@@ -1340,7 +2042,8 @@ namespace havCSON
 
         const LocationEntry keyLocation = Location();
         std::string key;
-        ErrorCode errorCode = ParseKey(key);
+        SourceSpan keySource;
+        ErrorCode errorCode = ParseKey(key, &keySource);
         if (errorCode != ErrorCode::OK)
         {
           return errorCode;
@@ -1386,6 +2089,7 @@ namespace havCSON
           {
             return errorCode2;
           }
+          RecordKeySource(value, keySource);
           object.emplace(std::move(key), std::move(value));
 
           if (mIndentStack.back() < bodyIndent)
@@ -1433,6 +2137,7 @@ namespace havCSON
           }
 
           // After parsing block value, check if we've dedented (nextContentLine was called inside the recursive parse)
+          RecordKeySource(value, keySource);
           object.emplace(std::move(key), std::move(value));
 
           // Check current indent level - if we've dedented out of this object, we're done
@@ -1454,6 +2159,7 @@ namespace havCSON
           }
         }
 
+        RecordKeySource(value, keySource);
         object.emplace(std::move(key), std::move(value));
 
         // End of line or another entry on same line (comma separated)
@@ -1523,12 +2229,27 @@ namespace havCSON
 
     ErrorCode ParseArray(Value& out, int parentIndent)
     {
+      if (!CanEnterContainer())
+      {
+        return ErrorCode::ResourceLimit;
+      }
+      const ContainerDepthGuard depthGuard(mContainerDepth);
       if (!Match('['))
       {
         return Fail(ErrorCode::InternalError, nullptr);
       }
 
       Array array;
+      std::optional<std::size_t> closingEnd;
+      const auto closeArray = [&]()
+      {
+        if (!Match(']'))
+        {
+          return false;
+        }
+        closingEnd = mPos;
+        return true;
+      };
 
       // Check if this is a multiline array (newline after '[')
       SkipInlineSpaces();
@@ -1554,9 +2275,10 @@ namespace havCSON
           // Empty array or just closing bracket
           if (Peek() == ']')
           {
-            Get();
+            (void)closeArray();
           }
           out = std::move(array);
+          mArrayClosingEnd = closingEnd;
           return ErrorCode::OK;
         }
 
@@ -1566,7 +2288,7 @@ namespace havCSON
         {
           if (Peek() == ']')
           {
-            Get();
+            (void)closeArray();
             break;
           }
 
@@ -1604,7 +2326,7 @@ namespace havCSON
             }
             continue;
           }
-          if (Match(']'))
+          if (closeArray())
           {
             break;
           }
@@ -1652,16 +2374,17 @@ namespace havCSON
 
         if (Peek() == ']')
         {
-          Get();
+          (void)closeArray();
         }
       }
       else
       {
         // Inline array
         SkipWhitespaceAndComments();
-        if (Match(']'))
+        if (closeArray())
         {
           out = std::move(array);
+          mArrayClosingEnd = closingEnd;
           return ErrorCode::OK;
         }
 
@@ -1669,7 +2392,7 @@ namespace havCSON
         {
           if (Peek() == ']')
           {
-            Get();
+            (void)closeArray();
             break;
           }
 
@@ -1682,7 +2405,7 @@ namespace havCSON
           array.push_back(std::move(value));
 
           SkipWhitespaceAndComments();
-          if (Match(']'))
+          if (closeArray())
           {
             break;
           }
@@ -1695,12 +2418,24 @@ namespace havCSON
       }
 
       out = std::move(array);
+      mArrayClosingEnd = closingEnd;
       return ErrorCode::OK;
     }
 
-    ErrorCode ParseKey(std::string& outKey)
+    ErrorCode ParseKey(std::string& outKey, SourceSpan* source = nullptr)
     {
       SkipInlineSpaces();
+      const auto begin = mPos;
+      const auto result = ParseKeyBody(outKey);
+      if (result == ErrorCode::OK && source && mOptions.trackSourceLocations)
+      {
+        *source = {SourcePositionAt(begin), SourcePositionAt(mPos)};
+      }
+      return result;
+    }
+
+    ErrorCode ParseKeyBody(std::string& outKey)
+    {
       char c = Peek();
       if (c == '"')
       {
@@ -1738,9 +2473,750 @@ namespace havCSON
     }
   };
 
-  inline ErrorCode Parse(std::string_view src, Value& out, Error* error = nullptr)
+  // Lossless edits use owned key/index paths. An empty path denotes the root.
+  // Source locations continue to refer to the original input after edits.
+  enum class RemovedCommentPolicy : std::uint8_t { Preserve, Discard };
+  enum class CommentIndentation : std::uint8_t { MatchDestination, PreserveOriginal };
+
+  struct LosslessEditOptions
   {
-    Parser p(src);
+    RemovedCommentPolicy removedComments = RemovedCommentPolicy::Preserve;
+    CommentIndentation commentIndentation = CommentIndentation::MatchDestination;
+    int indentWidth = 2; // Match the WriteOptions used when saving
+  };
+
+  namespace detail
+  {
+    inline bool LosslessError(Error* error, ErrorCode code, const ValuePath& path,
+                              std::string_view message, const Value* value = nullptr)
+    {
+      if (error)
+      {
+        *error = {};
+        error->code = code;
+        error->message = FormatValuePath(path) + ": " + std::string(message);
+        if (value && value->Source())
+        {
+          const auto& source = *value->Source();
+          error->where = {source.valueSpan.begin.line, source.valueSpan.begin.column};
+          if (source.filename)
+          {
+            error->filename = *source.filename;
+          }
+        }
+      }
+      return false;
+    }
+
+    inline bool CheckLosslessTree(const LosslessValue& node, ValuePath& path,
+                                   Error* error, bool compareSemantic)
+    {
+      if (node.value.isObject())
+      {
+        if (!node.arrayItems.empty())
+        {
+          return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                               "Object contains ordered array children", &node.value);
+        }
+        Object seen;
+        for (const auto& [key, child] : node.objectItems)
+        {
+          path.emplace_back(key);
+          if (!seen.emplace(key, nullptr).second)
+          {
+            return LosslessError(error, ErrorCode::DuplicateKey, path,
+                                 "Duplicate ordered object member", &child.value);
+          }
+          if (!CheckLosslessTree(child, path, error, compareSemantic))
+          {
+            return false;
+          }
+          if (compareSemantic)
+          {
+            const auto found = node.value.asObject().find(key);
+            if (found == node.value.asObject().end() || found->second != child.value)
+            {
+              return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                                   "Semantic and ordered object values differ", &child.value);
+            }
+          }
+          path.pop_back();
+        }
+        if ((compareSemantic && node.value.asObject().size() != node.objectItems.size()) ||
+            (!compareSemantic && node.objectItems.empty() && !node.value.asObject().empty()))
+        {
+          return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                               "Semantic members lack ordered children; use MakeLossless for semantic-only values", &node.value);
+        }
+      }
+      else if (node.value.isArray())
+      {
+        if (!node.objectItems.empty())
+        {
+          return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                               "Array contains ordered object members", &node.value);
+        }
+        if ((compareSemantic && node.value.asArray().size() != node.arrayItems.size()) ||
+            (!compareSemantic && node.arrayItems.empty() && !node.value.asArray().empty()))
+        {
+          return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                               "Semantic array lacks matching ordered children; use MakeLossless for semantic-only values", &node.value);
+        }
+        for (std::size_t index = 0; index < node.arrayItems.size(); ++index)
+        {
+          path.emplace_back(index);
+          if (!CheckLosslessTree(node.arrayItems[index], path, error, compareSemantic))
+          {
+            return false;
+          }
+          if (compareSemantic && node.value.asArray()[index] != node.arrayItems[index].value)
+          {
+            return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                                 "Semantic and ordered array values differ", &node.arrayItems[index].value);
+          }
+          path.pop_back();
+        }
+      }
+      else if (!node.arrayItems.empty() || !node.objectItems.empty())
+      {
+        return LosslessError(error, ErrorCode::InvalidLosslessTree, path,
+                             "Scalar contains ordered children", &node.value);
+      }
+      return true;
+    }
+
+    inline void SynchronizeLosslessTree(LosslessValue& node)
+    {
+      if (node.value.isObject())
+      {
+        Object members;
+        members.reserve(node.objectItems.size());
+        for (auto& [key, child] : node.objectItems)
+        {
+          SynchronizeLosslessTree(child);
+          members.emplace(key, child.value);
+        }
+        node.value.asObject() = std::move(members); // Retain the container's original source locations
+      }
+      else if (node.value.isArray())
+      {
+        Array items;
+        items.reserve(node.arrayItems.size());
+        for (auto& child : node.arrayItems)
+        {
+          SynchronizeLosslessTree(child);
+          items.push_back(child.value);
+        }
+        node.value.asArray() = std::move(items);
+      }
+    }
+
+    inline const LosslessValue* FindLosslessPath(const LosslessValue& root,
+                                                const ValuePath& path, Error* error)
+    {
+      const LosslessValue* current = &root;
+      ValuePath traversed;
+      for (const auto& segment : path)
+      {
+        traversed.push_back(segment);
+        if (const auto* key = std::get_if<std::string>(&segment))
+        {
+          if (!current->value.isObject())
+          {
+            LosslessError(error, ErrorCode::TypeMismatch, traversed, "Expected an object", &current->value);
+            return nullptr;
+          }
+          const auto found = std::find_if(current->objectItems.begin(), current->objectItems.end(),
+            [&](const auto& member) { return member.first == *key; });
+          if (found == current->objectItems.end())
+          {
+            LosslessError(error, ErrorCode::MissingMember, traversed, "Object member does not exist", &current->value);
+            return nullptr;
+          }
+          current = &found->second;
+        }
+        else
+        {
+          if (!current->value.isArray())
+          {
+            LosslessError(error, ErrorCode::TypeMismatch, traversed, "Expected an array", &current->value);
+            return nullptr;
+          }
+          const auto index = std::get<std::size_t>(segment);
+          if (index >= current->arrayItems.size())
+          {
+            LosslessError(error, ErrorCode::OutOfRange, traversed, "Array index is out of range", &current->value);
+            return nullptr;
+          }
+          current = &current->arrayItems[index];
+        }
+      }
+      return current;
+    }
+  }
+
+  inline bool ValidateLosslessTree(const LosslessValue& node, Error* error = nullptr)
+  {
+    if (error)
+    {
+      *error = {};
+    }
+    ValuePath path;
+    return detail::CheckLosslessTree(node, path, error, true);
+  }
+
+  // Explicitly choose ordered children as authoritative. Contradictory child
+  // kinds, duplicate keys, and nonempty semantic-only containers are rejected.
+  inline bool RebuildLosslessTree(LosslessValue& node, Error* error = nullptr)
+  {
+    if (error)
+    {
+      *error = {};
+    }
+    ValuePath path;
+    if (!detail::CheckLosslessTree(node, path, error, false))
+    {
+      return false;
+    }
+    LosslessValue rebuilt = node;
+    detail::SynchronizeLosslessTree(rebuilt);
+    node = std::move(rebuilt);
+    return true;
+  }
+
+  // Semantic objects have no order to preserve. Sort by key by default for
+  // reproducible output; false uses the unordered_map's iteration order.
+  inline LosslessValue MakeLossless(const Value& value, bool sortObjectKeys = true)
+  {
+    LosslessValue result;
+    result.value = value;
+    if (value.isArray())
+    {
+      for (const auto& child : value.asArray())
+      {
+        result.arrayItems.push_back(MakeLossless(child, sortObjectKeys));
+      }
+    }
+    else if (value.isObject())
+    {
+      for (const auto& [key, child] : value.asObject())
+      {
+        result.objectItems.emplace_back(key, MakeLossless(child, sortObjectKeys));
+      }
+      if (sortObjectKeys)
+      {
+        std::sort(result.objectItems.begin(), result.objectItems.end(),
+          [](const auto& left, const auto& right) { return left.first < right.first; });
+      }
+    }
+    return result;
+  }
+
+  class LosslessDocumentEditor
+  {
+  public:
+    static constexpr std::size_t Append = std::numeric_limits<std::size_t>::max();
+
+    explicit LosslessDocumentEditor(LosslessValue& root, LosslessEditOptions options = {})
+      : mRoot(root), mOptions(options) {}
+
+    const LosslessValue& Root() const noexcept { return mRoot; }
+
+    const LosslessValue* Find(const ValuePath& path, Error* error = nullptr) const
+    {
+      if (!ValidateLosslessTree(mRoot, error))
+      {
+        return nullptr;
+      }
+      return detail::FindLosslessPath(mRoot, path, error);
+    }
+
+    bool InsertMember(const ValuePath& path, std::string key, LosslessValue value,
+                      std::size_t position = Append, Error* error = nullptr)
+    {
+      if (!ValidateLosslessTree(value, error))
+      {
+        return false;
+      }
+      return Edit(path, error, [&](LosslessValue& object)
+      {
+        if (!object.value.isObject())
+        {
+          return Fail(error, ErrorCode::TypeMismatch, path, "Expected an object");
+        }
+        if (MemberIndex(object, key) != Append)
+        {
+          return Fail(error, ErrorCode::DuplicateKey, path, "Object member already exists");
+        }
+        if (position == Append)
+        {
+          position = object.objectItems.size();
+        }
+        if (position > object.objectItems.size())
+        {
+          return Fail(error, ErrorCode::OutOfRange, path, "Member insertion index is out of range");
+        }
+        object.objectItems.insert(object.objectItems.begin() + static_cast<std::ptrdiff_t>(position),
+                                  {std::move(key), std::move(value)});
+        return true;
+      });
+    }
+
+    // Original comments survive replacement, including comments in removed
+    // descendants. Incoming comments are retained as well. Fresh replacement
+    // values have no source locations. Copies retain their original source locations.
+    bool Replace(const ValuePath& path, LosslessValue replacement, Error* error = nullptr)
+    {
+      if (!ValidateLosslessTree(replacement, error))
+      {
+        return false;
+      }
+      const int indent = CommentIndent(path);
+      return Edit(path, error, [&](LosslessValue& original)
+      {
+        PreserveReplacementComments(original, replacement, indent);
+        original = std::move(replacement);
+        return true;
+      });
+    }
+
+    bool ReplaceMember(const ValuePath& path, std::string key, LosslessValue replacement, Error* error = nullptr)
+    {
+      auto child = path;
+      child.emplace_back(std::move(key));
+      return Replace(child, std::move(replacement), error);
+    }
+
+    bool RenameMember(const ValuePath& path, std::string_view oldKey, std::string newKey, Error* error = nullptr)
+    {
+      return Edit(path, error, [&](LosslessValue& object)
+      {
+        if (!object.value.isObject())
+        {
+          return Fail(error, ErrorCode::TypeMismatch, path, "Expected an object");
+        }
+        const auto index = MemberIndex(object, oldKey);
+        if (index == Append)
+        {
+          return Fail(error, ErrorCode::MissingMember, path, "Object member does not exist");
+        }
+        if (oldKey != newKey && MemberIndex(object, newKey) != Append)
+        {
+          return Fail(error, ErrorCode::DuplicateKey, path, "Object member already exists");
+        }
+        object.objectItems[index].first = std::move(newKey);
+        return true;
+      });
+    }
+
+    bool Remove(const ValuePath& path, Error* error = nullptr)
+    {
+      if (path.empty())
+      {
+        return Fail(error, ErrorCode::InvalidPath, path, "Cannot remove the document root");
+      }
+      auto parentPath = path;
+      const auto segment = parentPath.back();
+      parentPath.pop_back();
+      const int indent = CommentIndent(path);
+      return Edit(parentPath, error, [&](LosslessValue& parent)
+      {
+        if (const auto* key = std::get_if<std::string>(&segment))
+        {
+          if (!parent.value.isObject())
+          {
+            return Fail(error, ErrorCode::TypeMismatch, path, "Expected an object");
+          }
+          const auto index = MemberIndex(parent, *key);
+          if (index == Append)
+          {
+            return Fail(error, ErrorCode::MissingMember, path, "Object member does not exist");
+          }
+          auto comments = RemovedComments(parent.objectItems[index].second, indent);
+          parent.objectItems.erase(parent.objectItems.begin() + static_cast<std::ptrdiff_t>(index));
+          if (index < parent.objectItems.size())
+          {
+            Prepend(parent.objectItems[index].second.leadingComments, std::move(comments));
+          }
+          else
+          {
+            RelocateRemovedTailComments(parent, parentPath, std::move(comments));
+          }
+        }
+        else
+        {
+          if (!parent.value.isArray())
+          {
+            return Fail(error, ErrorCode::TypeMismatch, path, "Expected an array");
+          }
+          const auto index = std::get<std::size_t>(segment);
+          if (index >= parent.arrayItems.size())
+          {
+            return Fail(error, ErrorCode::OutOfRange, path, "Array index is out of range");
+          }
+          auto comments = RemovedComments(parent.arrayItems[index], indent);
+          parent.arrayItems.erase(parent.arrayItems.begin() + static_cast<std::ptrdiff_t>(index));
+          if (index < parent.arrayItems.size())
+          {
+            Prepend(parent.arrayItems[index].leadingComments, std::move(comments));
+          }
+          else
+          {
+            RelocateRemovedTailComments(parent, parentPath, std::move(comments));
+          }
+        }
+        return true;
+      });
+    }
+
+    bool RemoveMember(const ValuePath& path, std::string key, Error* error = nullptr)
+    {
+      auto child = path;
+      child.emplace_back(std::move(key));
+      return Remove(child, error);
+    }
+
+    bool MoveMember(const ValuePath& path, std::string_view key, std::size_t position, Error* error = nullptr)
+    {
+      return Edit(path, error, [&](LosslessValue& object)
+      {
+        if (!object.value.isObject())
+        {
+          return Fail(error, ErrorCode::TypeMismatch, path, "Expected an object");
+        }
+        const auto index = MemberIndex(object, key);
+        if (index == Append)
+        {
+          return Fail(error, ErrorCode::MissingMember, path, "Object member does not exist");
+        }
+        if (position == Append)
+        {
+          position = object.objectItems.size() - 1;
+        }
+        if (position >= object.objectItems.size())
+        {
+          return Fail(error, ErrorCode::OutOfRange, path, "Member destination index is out of range");
+        }
+        MoveItem(object.objectItems, index, position);
+        return true;
+      });
+    }
+
+    bool InsertArrayItem(const ValuePath& path, LosslessValue value,
+                         std::size_t position = Append, Error* error = nullptr)
+    {
+      if (!ValidateLosslessTree(value, error))
+      {
+        return false;
+      }
+      return Edit(path, error, [&](LosslessValue& array)
+      {
+        if (!array.value.isArray())
+        {
+          return Fail(error, ErrorCode::TypeMismatch, path, "Expected an array");
+        }
+        if (position == Append)
+        {
+          position = array.arrayItems.size();
+        }
+        if (position > array.arrayItems.size())
+        {
+          return Fail(error, ErrorCode::OutOfRange, path, "Array insertion index is out of range");
+        }
+        array.arrayItems.insert(array.arrayItems.begin() + static_cast<std::ptrdiff_t>(position), std::move(value));
+        return true;
+      });
+    }
+
+    bool ReplaceArrayItem(const ValuePath& path, std::size_t index, LosslessValue replacement, Error* error = nullptr)
+    {
+      auto child = path;
+      child.emplace_back(index);
+      return Replace(child, std::move(replacement), error);
+    }
+
+    bool RemoveArrayItem(const ValuePath& path, std::size_t index, Error* error = nullptr)
+    {
+      auto child = path;
+      child.emplace_back(index);
+      return Remove(child, error);
+    }
+
+    // The destination is the final zero-based index, not a pre-removal gap
+    bool MoveArrayItem(const ValuePath& path, std::size_t index, std::size_t position, Error* error = nullptr)
+    {
+      return Edit(path, error, [&](LosslessValue& array)
+      {
+        if (!array.value.isArray())
+        {
+          return Fail(error, ErrorCode::TypeMismatch, path, "Expected an array");
+        }
+        if (position == Append && !array.arrayItems.empty())
+        {
+          position = array.arrayItems.size() - 1;
+        }
+        if (index >= array.arrayItems.size() || position >= array.arrayItems.size())
+        {
+          return Fail(error, ErrorCode::OutOfRange, path, "Array index is out of range");
+        }
+        MoveItem(array.arrayItems, index, position);
+        return true;
+      });
+    }
+
+  private:
+    LosslessValue& mRoot;
+    LosslessEditOptions mOptions;
+
+    static bool Fail(Error* error, ErrorCode code, const ValuePath& path, std::string_view message)
+    {
+      return detail::LosslessError(error, code, path, message);
+    }
+
+    template<class Operation>
+    bool Edit(const ValuePath& path, Error* error, Operation&& operation)
+    {
+      if (!ValidateLosslessTree(mRoot, error))
+      {
+        return false;
+      }
+      if (mOptions.indentWidth < 1)
+      {
+        return Fail(error, ErrorCode::OutOfRange, path, "Comment indentation width must be positive");
+      }
+      LosslessValue candidate = mRoot;
+      auto* node = const_cast<LosslessValue*>(detail::FindLosslessPath(candidate, path, error));
+      if (!node || !operation(*node))
+      {
+        return false;
+      }
+      detail::SynchronizeLosslessTree(candidate);
+      mRoot = std::move(candidate);
+      if (error)
+      {
+        *error = {};
+      }
+      return true;
+    }
+
+    static std::size_t MemberIndex(const LosslessValue& object, std::string_view key)
+    {
+      for (std::size_t index = 0; index < object.objectItems.size(); ++index)
+      {
+        if (object.objectItems[index].first == key)
+        {
+          return index;
+        }
+      }
+      return Append;
+    }
+
+    template<class Item>
+    static void MoveItem(std::vector<Item>& items, std::size_t from, std::size_t to)
+    {
+      if (from == to)
+      {
+        return;
+      }
+      Item item = std::move(items[from]);
+      items.erase(items.begin() + static_cast<std::ptrdiff_t>(from));
+      items.insert(items.begin() + static_cast<std::ptrdiff_t>(to), std::move(item));
+    }
+
+    static void AppendComments(std::vector<LosslessComment>& target, std::vector<LosslessComment> comments)
+    {
+      for (auto& comment : comments)
+      {
+        target.push_back(std::move(comment));
+      }
+    }
+
+    static void Prepend(std::vector<LosslessComment>& target, std::vector<LosslessComment> comments)
+    {
+      AppendComments(comments, std::move(target));
+      target = std::move(comments);
+    }
+
+    static void RelocateRemovedTailComments(LosslessValue& parent, const ValuePath& parentPath,
+                                            std::vector<LosslessComment> comments)
+    {
+      // Keep removed-child trivia before the container's closing delimiter and
+      // its existing closing comments. Trailing comments belong outside it.
+      // Implicit objects have no closing delimiter unless the writer needs
+      // braces for closing trivia, an inline comment, or an array element.
+      const bool hasClosingDelimiter = parent.value.isArray() || !parent.closingComments.empty() ||
+        !parent.inlineComment.empty() ||
+        (!parentPath.empty() && std::holds_alternative<std::size_t>(parentPath.back()));
+
+      if (hasClosingDelimiter)
+      {
+        Prepend(parent.closingComments, std::move(comments));
+      }
+      else
+      {
+        Prepend(parent.trailingComments, std::move(comments));
+      }
+    }
+
+    // Track the same implicit-object/braced-object/array levels as the writer
+    int CommentIndent(const ValuePath& path) const
+    {
+      const LosslessValue* current = &mRoot;
+      std::size_t level = 0;
+      bool arrayItem = false;
+      std::size_t commentLevel = 0;
+      for (const auto& segment : path)
+      {
+        if (const auto* key = std::get_if<std::string>(&segment))
+        {
+          if (!current->value.isObject())
+          {
+            return 0;
+          }
+          const auto index = MemberIndex(*current, *key);
+          if (index == Append)
+          {
+            return 0;
+          }
+          level += arrayItem || !current->inlineComment.empty() || !current->closingComments.empty() ? 1 : 0;
+          commentLevel = level;
+          current = &current->objectItems[index].second;
+          if (current->value.isObject() || current->value.isArray())
+          {
+            ++level;
+          }
+          arrayItem = false;
+        }
+        else
+        {
+          const auto index = std::get<std::size_t>(segment);
+          if (!current->value.isArray() || index >= current->arrayItems.size())
+          {
+            return 0;
+          }
+          ++level;
+          commentLevel = level;
+          current = &current->arrayItems[index];
+          arrayItem = true;
+        }
+      }
+      const auto width = static_cast<std::size_t>(std::max(mOptions.indentWidth, 1));
+      if (commentLevel > static_cast<std::size_t>(INT_MAX) / width)
+      {
+        return INT_MAX;
+      }
+      return static_cast<int>(commentLevel * width);
+    }
+
+    std::vector<LosslessComment> DetachedComments(const LosslessValue& node, int indent) const
+    {
+      auto comments = node.leadingComments;
+      if (!node.blockComment.empty())
+      {
+        comments.push_back({indent, "#" + node.blockComment});
+      }
+      for (const auto& child : node.arrayItems)
+      {
+        AppendComments(comments, DetachedComments(child, indent));
+      }
+      for (const auto& member : node.objectItems)
+      {
+        AppendComments(comments, DetachedComments(member.second, indent));
+      }
+      AppendComments(comments, node.closingComments);
+      if (!node.inlineComment.empty())
+      {
+        comments.push_back({indent, "#" + node.inlineComment});
+      }
+      AppendComments(comments, node.trailingComments);
+      if (mOptions.commentIndentation == CommentIndentation::MatchDestination)
+      {
+        for (auto& comment : comments)
+        {
+          comment.indent = indent;
+        }
+      }
+      return comments;
+    }
+
+    std::vector<LosslessComment> RemovedComments(const LosslessValue& node, int indent) const
+    {
+      return mOptions.removedComments == RemovedCommentPolicy::Preserve
+        ? DetachedComments(node, indent) : std::vector<LosslessComment>{};
+    }
+
+    void PreserveReplacementComments(const LosslessValue& original, LosslessValue& replacement, int indent) const
+    {
+      const auto preserveLines = [](std::vector<LosslessComment>& target, const std::vector<LosslessComment>& source)
+      {
+        const bool same = target.size() == source.size() &&
+          std::equal(target.begin(), target.end(), source.begin(),
+            [](const auto& left, const auto& right) { return left.indent == right.indent && left.text == right.text; });
+        if (!same)
+        {
+          Prepend(target, source);
+        }
+      };
+      preserveLines(replacement.leadingComments, original.leadingComments);
+      if (!original.blockComment.empty())
+      {
+        if (!replacement.blockComment.empty() && replacement.blockComment != original.blockComment)
+        {
+          replacement.leadingComments.push_back({indent, "#" + replacement.blockComment});
+        }
+        replacement.blockComment = original.blockComment;
+      }
+      if (!original.inlineComment.empty())
+      {
+        if (!replacement.inlineComment.empty() && replacement.inlineComment != original.inlineComment)
+        {
+          replacement.leadingComments.push_back({indent, "#" + replacement.inlineComment});
+        }
+        replacement.inlineComment = original.inlineComment;
+      }
+      std::vector<LosslessComment> nested;
+      for (std::size_t index = 0; index < original.arrayItems.size(); ++index)
+      {
+        if (replacement.value.isArray() && index < replacement.arrayItems.size())
+        {
+          PreserveReplacementComments(original.arrayItems[index], replacement.arrayItems[index], indent);
+        }
+        else
+        {
+          AppendComments(nested, DetachedComments(original.arrayItems[index], indent));
+        }
+      }
+      for (const auto& [key, child] : original.objectItems)
+      {
+        const auto index = replacement.value.isObject() ? MemberIndex(replacement, key) : Append;
+        if (index != Append)
+        {
+          PreserveReplacementComments(child, replacement.objectItems[index].second, indent);
+        }
+        else
+        {
+          AppendComments(nested, DetachedComments(child, indent));
+        }
+      }
+      preserveLines(replacement.closingComments, original.closingComments);
+      Prepend(replacement.closingComments, std::move(nested));
+      preserveLines(replacement.trailingComments, original.trailingComments);
+      if (!replacement.value.isObject() && !replacement.value.isArray())
+      {
+        if (!replacement.blockComment.empty())
+        {
+          replacement.leadingComments.push_back({indent, "#" + replacement.blockComment});
+          replacement.blockComment.clear();
+        }
+        Prepend(replacement.trailingComments, std::move(replacement.closingComments));
+        replacement.closingComments.clear();
+      }
+    }
+  };
+
+  inline ErrorCode Parse(std::string_view src, Value& out, Error* error = nullptr, const ParseOptions& options = {})
+  {
+    Parser p(src, {}, options);
     return p.Parse(out, error);
   }
 
@@ -1750,13 +3226,31 @@ namespace havCSON
     class LosslessParser : private Parser
     {
     public:
-      explicit LosslessParser(std::string_view src, std::string_view filename = {}) : Parser(src, filename)
+      explicit LosslessParser(std::string_view src, std::string_view filename = {}, const ParseOptions& options = {})
+        : Parser(src, filename, options)
       {}
 
       ErrorCode Parse(LosslessValue& out, Error* error)
       {
-        // Reset previous error state for a fresh parse
-        mError = {};
+        LosslessValue parsed;
+        const auto result = ParseDocument(parsed, error);
+        if (result == ErrorCode::OK)
+        {
+          out = std::move(parsed);
+        }
+        return result;
+      }
+
+    private:
+      ErrorCode ParseDocument(LosslessValue& out, Error* error)
+      {
+        ResetParseState();
+        mPendingComments.clear();
+
+        if (InputLimitExceeded())
+        {
+          return Finish(ErrorCode::ResourceLimit, error, "Maximum input byte count exceeded");
+        }
 
         // Validate UTF-8 up front (strips leading BOM)
         std::size_t badIndex = 0;
@@ -1796,22 +3290,40 @@ namespace havCSON
           return Finish(errorCode, error);
         }
 
-        // After parsing top-level value, consume any remaining whitespace / comments and ensure we're back at indent
-        // level 0
-        while (!EndOfFile())
+        // Explicit top-level containers and scalars leave their final newline
+        // to this caller. Preserve their inline and subsequent full-line trivia.
+        if (!EndOfFile() && mCol != 1)
         {
-          char c = Peek();
-          if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+          SkipInlineSpaces();
+          if (Peek() == '#')
           {
-            Get();
-            continue;
+            out.inlineComment = ReadInlineComment();
           }
-          if (c == '#')
+          else if (Peek() == '\r' || Peek() == '\n')
           {
-            SkipToEOL();
-            continue;
+            const char newline = Get();
+            if (newline == '\r' && Peek() == '\n')
+            {
+              Get();
+            }
           }
-          break;
+          else if (!EndOfFile())
+          {
+            return Finish(ErrorCode::UnexpectedChar, error, "Trailing characters after top-level value");
+          }
+        }
+        if (!EndOfFile())
+        {
+          hasLine = false;
+          errorCode = NextContentLineLossless(hasLine, mPendingComments);
+          if (errorCode != ErrorCode::OK)
+          {
+            return Finish(errorCode, error);
+          }
+          if (hasLine)
+          {
+            return Finish(ErrorCode::UnexpectedChar, error, "Trailing characters after top-level value");
+          }
         }
 
         // Any remaining pending comments belong after the root value
@@ -1878,6 +3390,7 @@ namespace havCSON
         {
           if (message.has_value())
           {
+            *error = {};
             error->code = errorCode;
             error->where = Location();
             error->message.assign(message->data(), message->size());
@@ -1889,6 +3402,7 @@ namespace havCSON
           }
           else
           {
+            *error = {};
             error->code = errorCode;
             error->where = Location();
             error->message.clear();
@@ -1958,6 +3472,17 @@ namespace havCSON
       }
 
       ErrorCode ParseValueLossless(LosslessValue& out, int currentIndent, bool consumePending = true)
+      {
+        const auto begin = mPos;
+        const auto result = ParseValueLosslessBody(out, currentIndent, consumePending);
+        if (result == ErrorCode::OK)
+        {
+          RecordSource(out.value, begin);
+        }
+        return result;
+      }
+
+      ErrorCode ParseValueLosslessBody(LosslessValue& out, int currentIndent, bool consumePending)
       {
         if (consumePending && !mPendingComments.empty())
         {
@@ -2032,6 +3557,11 @@ namespace havCSON
 
       ErrorCode ParseInlineObjectLossless(LosslessValue& out, int currentIndent)
       {
+        if (!CanEnterContainer())
+        {
+          return ErrorCode::ResourceLimit;
+        }
+        const ContainerDepthGuard depthGuard(mContainerDepth);
         if (!Match('{'))
         {
           return Finish(ErrorCode::InternalError, nullptr);
@@ -2087,7 +3617,8 @@ namespace havCSON
             preKeyComments.swap(mPendingComments);
             const LocationEntry keyLocation = Location();
             std::string key;
-            errorCode = ParseKey(key);
+            SourceSpan keySource;
+            errorCode = ParseKey(key, &keySource);
             if (errorCode != ErrorCode::OK)
             {
               return errorCode;
@@ -2142,25 +3673,32 @@ namespace havCSON
               return errorCode;
             }
 
+            RecordKeySource(child.value, keySource);
             out.objectItems.emplace_back(key, child);
             object.emplace(std::move(key), child.value);
 
             SkipInlineSpaces();
+            bool commentConsumedNewline = false;
             if (Peek() == '#')
             {
               out.objectItems.back().second.inlineComment = ReadInlineComment();
+              commentConsumedNewline = true;
             }
-            if (Match(','))
+            if (!commentConsumedNewline && Match(','))
             {
               SkipInlineSpaces();
             }
-            if (Peek() == '\r' || Peek() == '\n')
+            if (!commentConsumedNewline && (Peek() == '\r' || Peek() == '\n'))
             {
               newline = Get();
               if (newline == '\r' && Peek() == '\n')
               {
                 Get();
               }
+              commentConsumedNewline = true;
+            }
+            if (commentConsumedNewline)
+            {
               hasLine = false;
               errorCode = NextContentLineLossless(hasLine, mPendingComments);
               if (errorCode != ErrorCode::OK)
@@ -2201,7 +3739,8 @@ namespace havCSON
 
           const LocationEntry keyLocation = Location();
           std::string key;
-          ErrorCode errorCode = ParseKey(key);
+          SourceSpan keySource;
+          ErrorCode errorCode = ParseKey(key, &keySource);
           if (errorCode != ErrorCode::OK)
           {
             return errorCode;
@@ -2223,6 +3762,7 @@ namespace havCSON
           {
             return errorCode;
           }
+          RecordKeySource(child.value, keySource);
           out.objectItems.emplace_back(key, child);
           object.emplace(std::move(key), child.value);
           SkipWhitespaceAndComments();
@@ -2240,14 +3780,90 @@ namespace havCSON
         return ErrorCode::OK;
       }
 
+      // Match the inline array grammar's whitespace handling without discarding
+      // trivia or changing the indentation stack. A comment after '[' does not
+      // make an inline array newline-separated; commas are still required.
+      void CollectArrayTriviaLossless(LosslessValue* previous = nullptr)
+      {
+        // Nested indentation parsing may already have advanced to a new line.
+        // Only attach inline trivia if this physical line contains a token.
+        bool hasContentOnLine = false;
+        for (auto position = mPos; position > 0;)
+        {
+          const char character = mSrc[--position];
+          if (character == '\r' || character == '\n')
+          {
+            break;
+          }
+          if (character != ' ' && character != '\t')
+          {
+            hasContentOnLine = true;
+            break;
+          }
+        }
+        bool sameLine = previous != nullptr && hasContentOnLine;
+        bool blankLine = !hasContentOnLine;
+        while (!EndOfFile())
+        {
+          SkipInlineSpaces();
+          if (Peek() == '#')
+          {
+            const int indent = static_cast<int>(mCol) - 1;
+            auto comment = ReadInlineComment();
+            if (sameLine && previous && previous->inlineComment.empty() &&
+                mPendingComments.empty() && !comment.empty())
+            {
+              previous->inlineComment = std::move(comment);
+            }
+            else
+            {
+              mPendingComments.push_back({indent, "#" + comment});
+            }
+            sameLine = false;
+            blankLine = true;
+          }
+          else if (Peek() == '\r' || Peek() == '\n')
+          {
+            if (blankLine)
+            {
+              mPendingComments.push_back({0, {}});
+            }
+            SkipToEOL();
+            sameLine = false;
+            blankLine = true;
+          }
+          else
+          {
+            break;
+          }
+        }
+      }
+
       ErrorCode ParseArrayLossless(LosslessValue& out, int parentIndent)
       {
+        if (!CanEnterContainer())
+        {
+          return ErrorCode::ResourceLimit;
+        }
+        const ContainerDepthGuard depthGuard(mContainerDepth);
         if (!Match('['))
         {
           return Finish(ErrorCode::InternalError, nullptr);
         }
 
         Array array;
+        std::optional<std::size_t> closingEnd;
+        const auto closeArray = [&]()
+        {
+          if (!Match(']'))
+          {
+            return false;
+          }
+          out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
+          mPendingComments.clear();
+          closingEnd = mPos;
+          return true;
+        };
 
         SkipInlineSpaces();
         bool isMultiline = (Peek() == '\r' || Peek() == '\n');
@@ -2270,11 +3886,10 @@ namespace havCSON
           {
             if (Peek() == ']')
             {
-              out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
-              mPendingComments.clear();
-              Get();
+              (void)closeArray();
             }
             out.value = std::move(array);
+            mArrayClosingEnd = closingEnd;
             return ErrorCode::OK;
           }
 
@@ -2283,9 +3898,7 @@ namespace havCSON
           {
             if (Peek() == ']')
             {
-              out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
-              mPendingComments.clear();
-              Get();
+              (void)closeArray();
               break;
             }
 
@@ -2368,13 +3981,13 @@ namespace havCSON
                 continue;
               }
             }
-            if (Match(']'))
+            if (closeArray())
             {
               break;
             }
             if (Match(','))
             {
-              SkipWhitespaceAndComments();
+              CollectArrayTriviaLossless(&out.arrayItems.back());
               continue;
             }
             if (Peek() == '\r' || Peek() == '\n')
@@ -2402,17 +4015,16 @@ namespace havCSON
           // After loop, consume closing ] if present
           if (Peek() == ']')
           {
-            out.closingComments.insert(out.closingComments.end(), mPendingComments.begin(), mPendingComments.end());
-            mPendingComments.clear();
-            Get();
+            (void)closeArray();
           }
         }
         else
         {
-          SkipWhitespaceAndComments();
-          if (Match(']'))
+          CollectArrayTriviaLossless();
+          if (closeArray())
           {
             out.value = std::move(array);
+            mArrayClosingEnd = closingEnd;
             return ErrorCode::OK;
           }
 
@@ -2420,7 +4032,7 @@ namespace havCSON
           {
             if (Peek() == ']')
             {
-              Get();
+              (void)closeArray();
               break;
             }
 
@@ -2433,8 +4045,8 @@ namespace havCSON
             array.push_back(child.value);
             out.arrayItems.push_back(std::move(child));
 
-            SkipWhitespaceAndComments();
-            if (Match(']'))
+            CollectArrayTriviaLossless(&out.arrayItems.back());
+            if (closeArray())
             {
               break;
             }
@@ -2442,16 +4054,19 @@ namespace havCSON
             {
               return Finish(ErrorCode::UnexpectedChar, nullptr, "Expected ',' or ']' in inline array");
             }
-            SkipWhitespaceAndComments();
+            CollectArrayTriviaLossless(&out.arrayItems.back());
           }
         }
 
         out.value = std::move(array);
+        mArrayClosingEnd = closingEnd;
         return ErrorCode::OK;
       }
 
       ErrorCode ParseIdentifierOrIndentedObjectLossless(LosslessValue& out, int currentIndent)
       {
+        const auto savedPos = mPos;
+        const auto savedColumn = mCol;
         std::string identifier;
         while (IsIdentifierChar(Peek()))
         {
@@ -2460,8 +4075,8 @@ namespace havCSON
         SkipInlineSpaces();
         if (Peek() == ':')
         {
-          mPos -= identifier.size();
-          mCol -= identifier.size();
+          mPos = savedPos;
+          mCol = savedColumn;
           Object object;
           ErrorCode errorCode = ParseIndentedObjectBodyLossless(object, out, currentIndent);
           if (errorCode != ErrorCode::OK)
@@ -2493,6 +4108,11 @@ namespace havCSON
 
       ErrorCode ParseIndentedObjectBodyLossless(Object& obj, LosslessValue& outWrapper, int parentIndent)
       {
+        if (!CanEnterContainer())
+        {
+          return ErrorCode::ResourceLimit;
+        }
+        const ContainerDepthGuard depthGuard(mContainerDepth);
         int bodyIndent = -1;
 
         while (true)
@@ -2542,7 +4162,8 @@ namespace havCSON
 
           const LocationEntry keyLocation = Location();
           std::string key;
-          ErrorCode errorCode = ParseKey(key);
+          SourceSpan keySource;
+          ErrorCode errorCode = ParseKey(key, &keySource);
           if (errorCode != ErrorCode::OK)
           {
             return errorCode;
@@ -2615,6 +4236,7 @@ namespace havCSON
               return errorCode2;
             }
 
+            RecordKeySource(child.value, keySource);
             outWrapper.objectItems.emplace_back(key, child);
             obj.emplace(std::move(key), child.value);
 
@@ -2667,6 +4289,7 @@ namespace havCSON
           {
             return errorCode;
           }
+          RecordKeySource(child.value, keySource);
           outWrapper.objectItems.emplace_back(key, child);
           obj.emplace(std::move(key), child.value);
 
@@ -2785,66 +4408,100 @@ namespace havCSON
     };
   } // namespace detail
 
-  inline ErrorCode ParseLossless(std::string_view src, LosslessValue& out, Error* error = nullptr)
+  inline ErrorCode ParseLossless(std::string_view src, LosslessValue& out, Error* error = nullptr, const ParseOptions& options = {})
   {
-    detail::LosslessParser losslessParser(src);
+    detail::LosslessParser losslessParser(src, {}, options);
     return losslessParser.Parse(out, error);
   }
 
   namespace detail
   {
-    inline ErrorCode ReadFileUTF8(const std::string& path, std::string& data, Error* error)
+    inline bool SetFileError(Error* error, std::string_view message,
+                             const std::string& path, std::string_view operation,
+                             std::error_code cause)
+    {
+      if (error)
+      {
+        *error = {};
+        error->code = ErrorCode::IoError;
+        error->message = message;
+        error->filename = path;
+        error->operation = operation;
+        error->systemError = cause;
+      }
+      return false;
+    }
+
+    inline std::error_code ErrnoCode(int value = errno)
+    {
+      return std::error_code(value, std::generic_category());
+    }
+
+    inline std::error_code NativeFileError()
+    {
+#ifdef _WIN32
+      return std::error_code(static_cast<int>(GetLastError()), std::system_category());
+#else
+      return ErrnoCode();
+#endif
+    }
+
+    inline ErrorCode ReadFileUTF8(const std::string& path, std::string& data, Error* error,
+                                  std::size_t maxInputBytes = 0)
     {
       auto fileStream = OpenFileUTF8(path, "rb");
       if (!fileStream)
       {
-        if (error)
-        {
-          error->code = ErrorCode::InternalError;
-          error->where = {};
-          error->message = "Failed to open file";
-          error->filename = path;
-        }
-        return ErrorCode::InternalError;
+        SetFileError(error, "Failed to open file", path, "open", ErrnoCode());
+        return ErrorCode::IoError;
       }
-      if (std::fseek(fileStream.get(), 0, SEEK_END) != 0)
+
+      // Read incrementally instead of allocating a pre-statted size: the file
+      // can grow between a size query and a read. One extra byte tests the cap.
+      std::string result;
+      std::array<char, 8192> buffer{};
+      while (true)
       {
-        if (error)
+        std::size_t count = buffer.size();
+        if (maxInputBytes != 0)
         {
-          error->code = ErrorCode::InternalError;
-          error->where = {};
-          error->message = "Failed to read file";
-          error->filename = path;
+          const auto remaining = maxInputBytes - result.size();
+          if (remaining < count)
+          {
+            count = remaining + 1;
+          }
         }
-        return ErrorCode::InternalError;
-      }
-      const long size = std::ftell(fileStream.get());
-      if (size < 0 || std::fseek(fileStream.get(), 0, SEEK_SET) != 0)
-      {
-        if (error)
+        errno = 0;
+        const auto read = std::fread(buffer.data(), 1, count, fileStream.get());
+        const auto readError = ErrnoCode();
+        if (std::ferror(fileStream.get()))
         {
-          error->code = ErrorCode::InternalError;
-          error->where = {};
-          error->message = "Failed to read file";
-          error->filename = path;
+          SetFileError(error, "Failed to read file", path, "read", readError);
+          return ErrorCode::IoError;
         }
-        return ErrorCode::InternalError;
-      }
-      data.assign(static_cast<std::size_t>(size), '\0');
-      if (!data.empty())
-      {
-        if (std::fread(data.data(), 1, static_cast<std::size_t>(size), fileStream.get()) != static_cast<std::size_t>(size))
+        if (maxInputBytes != 0 && read > maxInputBytes - result.size())
         {
           if (error)
           {
-            error->code = ErrorCode::InternalError;
-            error->where = {};
-            error->message = "Failed to read file";
+            *error = {};
+            error->code = ErrorCode::ResourceLimit;
+            error->message = "Maximum input byte count exceeded";
             error->filename = path;
           }
-          return ErrorCode::InternalError;
+          return ErrorCode::ResourceLimit;
+        }
+        result.append(buffer.data(), read);
+        if (read < count)
+        {
+          break;
         }
       }
+      if (std::fclose(fileStream.release()) != 0)
+      {
+        SetFileError(error, "Failed to close file", path, "close", ErrnoCode());
+        return ErrorCode::IoError;
+      }
+      data = std::move(result);
       if (error)
       {
         *error = {};
@@ -2853,27 +4510,27 @@ namespace havCSON
     }
   } // namespace detail
 
-  inline ErrorCode ParseFile(const std::string& path, Value& out, Error* error = nullptr)
+  inline ErrorCode ParseFile(const std::string& path, Value& out, Error* error = nullptr, const ParseOptions& options = {})
   {
     std::string data;
-    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error);
+    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error, options.maxInputBytes);
     if (readResult != ErrorCode::OK)
     {
       return readResult;
     }
-    Parser parser(std::string_view(data), path);
+    Parser parser(std::string_view(data), path, options);
     return parser.Parse(out, error);
   }
 
-  inline ErrorCode ParseFileLossless(const std::string& path, LosslessValue& out, Error* error = nullptr)
+  inline ErrorCode ParseFileLossless(const std::string& path, LosslessValue& out, Error* error = nullptr, const ParseOptions& options = {})
   {
     std::string data;
-    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error);
+    const ErrorCode readResult = detail::ReadFileUTF8(path, data, error, options.maxInputBytes);
     if (readResult != ErrorCode::OK)
     {
       return readResult;
     }
-    detail::LosslessParser losslessParser(std::string_view(data), path);
+    detail::LosslessParser losslessParser(std::string_view(data), path, options);
     return losslessParser.Parse(out, error);
   }
 
@@ -2889,11 +4546,11 @@ namespace havCSON
     }
   };
 
-  inline Value ParseOrThrow(std::string_view src)
+  inline Value ParseOrThrow(std::string_view src, const ParseOptions& options = {})
   {
     Value value;
     Error error;
-    ErrorCode errorCode = Parse(src, value, &error);
+    ErrorCode errorCode = Parse(src, value, &error, options);
     if (errorCode != ErrorCode::OK)
     {
       throw ParseException(error);
@@ -2901,11 +4558,11 @@ namespace havCSON
     return value;
   }
 
-  inline Value ParseFileOrThrow(const std::string& path)
+  inline Value ParseFileOrThrow(const std::string& path, const ParseOptions& options = {})
   {
     Value value;
     Error error;
-    ErrorCode errorCode = ParseFile(path, value, &error);
+    ErrorCode errorCode = ParseFile(path, value, &error, options);
     if (errorCode != ErrorCode::OK)
     {
       throw ParseException(error);
@@ -2913,11 +4570,11 @@ namespace havCSON
     return value;
   }
 
-  inline LosslessValue ParseLosslessOrThrow(std::string_view src)
+  inline LosslessValue ParseLosslessOrThrow(std::string_view src, const ParseOptions& options = {})
   {
     LosslessValue value;
     Error error;
-    const ErrorCode errorCode = ParseLossless(src, value, &error);
+    const ErrorCode errorCode = ParseLossless(src, value, &error, options);
     if (errorCode != ErrorCode::OK)
     {
       throw ParseException(error);
@@ -3051,6 +4708,7 @@ namespace havCSON
         {
           if (error)
           {
+            *error = {};
             error->code = ErrorCode::InvalidNumber;
             error->where = {};
             error->message = "Non-finite number value";
@@ -3537,7 +5195,8 @@ namespace havCSON
         WriteCommentLines(value.leadingComments, out);
       }
 
-      if (std::holds_alternative<Array>(value.value) && !value.arrayItems.empty())
+      if (std::holds_alternative<Array>(value.value) &&
+          (!value.arrayItems.empty() || (value.value.asArray().empty() && !value.closingComments.empty())))
       {
         WriteIndent(out, indentLevel, options.indentWidth);
         out.append("[\n");
@@ -3554,7 +5213,8 @@ namespace havCSON
         return;
       }
 
-      if (std::holds_alternative<Object>(value.value) && !value.objectItems.empty())
+      if (std::holds_alternative<Object>(value.value) &&
+          (!value.objectItems.empty() || (value.value.asObject().empty() && !value.closingComments.empty())))
       {
         const bool useBraces =
           ctx == WriteContext::InArray || !value.inlineComment.empty() || !value.closingComments.empty();
@@ -3630,44 +5290,34 @@ namespace havCSON
 
   namespace detail
   {
-    inline bool SetFileError(Error* error, std::string_view message)
-    {
-      if (error)
-      {
-        error->code = ErrorCode::InternalError;
-        error->where = {};
-        error->message.assign(message.begin(), message.end());
-      }
-      return false;
-    }
-
     inline bool WriteFileContents(const std::string& path, std::string_view contents, Error* error)
     {
       auto fileStream = OpenFileUTF8(path, "wb");
       if (!fileStream)
       {
-        return SetFileError(error, "Failed to open file for writing");
+        return SetFileError(error, "Failed to open file for writing", path, "open", ErrnoCode());
       }
 
       std::size_t offset = 0;
       while (offset < contents.size())
       {
+        errno = 0;
         const std::size_t written = std::fwrite(contents.data() + offset, 1, contents.size() - offset, fileStream.get());
         if (written == 0)
         {
-          return SetFileError(error, "Failed to write file");
+          return SetFileError(error, "Failed to write file", path, "write", ErrnoCode());
         }
         offset += written;
       }
       if (std::fflush(fileStream.get()) != 0)
       {
-        return SetFileError(error, "Failed to flush file");
+        return SetFileError(error, "Failed to flush file", path, "flush", ErrnoCode());
       }
 
       std::FILE* rawFile = fileStream.release();
       if (std::fclose(rawFile) != 0)
       {
-        return SetFileError(error, "Failed to close file");
+        return SetFileError(error, "Failed to close file", path, "close", ErrnoCode());
       }
       if (error)
       {
@@ -3755,7 +5405,7 @@ namespace havCSON
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::TemporaryOpen))
       {
-        return SetFileError(error, "Simulated atomic temporary-file open failure");
+        return SetFileError(error, "Simulated atomic temporary-file open failure", path, "open", std::make_error_code(std::errc::io_error));
       }
 #endif
 
@@ -3764,7 +5414,7 @@ namespace havCSON
         temporaryPath = ConvertStringToWString(AtomicTemporaryPath(path, uniqueSequence, attempt), true);
         if (temporaryPath.empty())
         {
-          return SetFileError(error, "Invalid UTF-8 atomic temporary-file path");
+          return SetFileError(error, "Invalid UTF-8 atomic temporary-file path", path, "open", std::make_error_code(std::errc::illegal_byte_sequence));
         }
         file = CreateFileW(temporaryPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file != INVALID_HANDLE_VALUE)
@@ -3774,28 +5424,28 @@ namespace havCSON
         const DWORD openError = GetLastError();
         if (openError != ERROR_FILE_EXISTS && openError != ERROR_ALREADY_EXISTS)
         {
-          return SetFileError(error, "Failed to create atomic temporary file");
+          return SetFileError(error, "Failed to create atomic temporary file", path, "open", std::error_code(static_cast<int>(openError), std::system_category()));
         }
       }
       if (file == INVALID_HANDLE_VALUE)
       {
-        return SetFileError(error, "Failed to allocate a unique atomic temporary file");
+        return SetFileError(error, "Failed to allocate a unique atomic temporary file", path, "open", std::make_error_code(std::errc::file_exists));
       }
 
-      auto fail = [&](std::string_view message) {
+      auto fail = [&](std::string_view message, std::string_view operation, std::error_code cause) {
         if (file != INVALID_HANDLE_VALUE)
         {
           CloseHandle(file);
           file = INVALID_HANDLE_VALUE;
         }
         DeleteFileW(temporaryPath.c_str());
-        return SetFileError(error, message);
+        return SetFileError(error, message, path, operation, cause);
       };
 
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Write))
       {
-        return fail("Simulated atomic write failure");
+        return fail("Simulated atomic write failure", "write", std::make_error_code(std::errc::io_error));
       }
 #endif
 
@@ -3806,9 +5456,13 @@ namespace havCSON
         const std::size_t remaining = contents.size() - offset;
         const DWORD chunk = static_cast<DWORD>(std::min(remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
         DWORD written = 0;
-        if (!::WriteFile(file, contents.data() + offset, chunk, &written, nullptr) || written == 0)
+        if (!::WriteFile(file, contents.data() + offset, chunk, &written, nullptr))
         {
-          return fail("Failed to write atomic temporary file");
+          return fail("Failed to write atomic temporary file", "write", NativeFileError());
+        }
+        if (written == 0)
+        {
+          return fail("Atomic write made no progress", "write", {});
         }
         offset += static_cast<std::size_t>(written);
       }
@@ -3816,50 +5470,47 @@ namespace havCSON
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Flush))
       {
-        return fail("Simulated atomic flush failure");
+        return fail("Simulated atomic flush failure", "flush", std::make_error_code(std::errc::io_error));
       }
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Sync))
       {
-        return fail("Simulated atomic sync failure");
+        return fail("Simulated atomic sync failure", "sync", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (!FlushFileBuffers(file))
       {
-        return fail("Failed to flush atomic temporary file");
+        return fail("Failed to flush atomic temporary file", "flush", NativeFileError());
       }
 
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Close))
       {
-        return fail("Simulated atomic close failure");
+        return fail("Simulated atomic close failure", "close", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (!CloseHandle(file))
       {
+        const auto cause = NativeFileError();
         file = INVALID_HANDLE_VALUE;
-        DeleteFileW(temporaryPath.c_str());
-        return SetFileError(error, "Failed to close atomic temporary file");
+        return fail("Failed to close atomic temporary file", "close", cause);
       }
       file = INVALID_HANDLE_VALUE;
 
       const std::wstring destinationPath = ConvertStringToWString(path, true);
       if (destinationPath.empty())
       {
-        DeleteFileW(temporaryPath.c_str());
-        return SetFileError(error, "Invalid UTF-8 destination path");
+        return fail("Invalid UTF-8 destination path", "replace", std::make_error_code(std::errc::illegal_byte_sequence));
       }
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Replace))
       {
-        DeleteFileW(temporaryPath.c_str());
-        return SetFileError(error, "Simulated atomic replacement failure");
+        return fail("Simulated atomic replacement failure", "replace", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (!MoveFileExW(
             temporaryPath.c_str(), destinationPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
       {
-        DeleteFileW(temporaryPath.c_str());
-        return SetFileError(error, "Failed to atomically replace destination file");
+        return fail("Failed to atomically replace destination file", "replace", NativeFileError());
       }
       if (error)
       {
@@ -3882,13 +5533,15 @@ namespace havCSON
       const int directoryFile = ::open(directory.c_str(), flags);
       if (directoryFile < 0)
       {
-        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be opened for sync");
+        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be opened for sync", path, "openDirectory", ErrnoCode());
       }
       const bool synced = ::fsync(directoryFile) == 0;
+      const auto syncError = ErrnoCode();
       const bool closed = ::close(directoryFile) == 0;
       if (!synced || !closed)
       {
-        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be synced");
+        return SetFileError(error, "Atomic replacement succeeded, but its directory could not be synced", path,
+                            synced ? "closeDirectory" : "syncDirectory", synced ? ErrnoCode() : syncError);
       }
       return true;
     }
@@ -3903,7 +5556,7 @@ namespace havCSON
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::TemporaryOpen))
       {
-        return SetFileError(error, "Simulated atomic temporary-file open failure");
+        return SetFileError(error, "Simulated atomic temporary-file open failure", path, "open", std::make_error_code(std::errc::io_error));
       }
 #endif
 
@@ -3921,28 +5574,28 @@ namespace havCSON
         }
         if (errno != EEXIST)
         {
-          return SetFileError(error, "Failed to create atomic temporary file");
+          return SetFileError(error, "Failed to create atomic temporary file", path, "open", ErrnoCode());
         }
       }
       if (file < 0)
       {
-        return SetFileError(error, "Failed to allocate a unique atomic temporary file");
+        return SetFileError(error, "Failed to allocate a unique atomic temporary file", path, "open", std::make_error_code(std::errc::file_exists));
       }
 
-      auto fail = [&](std::string_view message) {
+      auto fail = [&](std::string_view message, std::string_view operation, std::error_code cause) {
         if (file >= 0)
         {
           ::close(file);
           file = -1;
         }
         ::unlink(temporaryPath.c_str());
-        return SetFileError(error, message);
+        return SetFileError(error, message, path, operation, cause);
       };
 
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Write))
       {
-        return fail("Simulated atomic write failure");
+        return fail("Simulated atomic write failure", "write", std::make_error_code(std::errc::io_error));
       }
 #endif
 
@@ -3956,9 +5609,13 @@ namespace havCSON
         {
           continue;
         }
-        if (written <= 0)
+        if (written < 0)
         {
-          return fail("Failed to write atomic temporary file");
+          return fail("Failed to write atomic temporary file", "write", ErrnoCode());
+        }
+        if (written == 0)
+        {
+          return fail("Atomic write made no progress", "write", {});
         }
         offset += static_cast<std::size_t>(written);
       }
@@ -3966,29 +5623,29 @@ namespace havCSON
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Flush))
       {
-        return fail("Simulated atomic flush failure");
+        return fail("Simulated atomic flush failure", "flush", std::make_error_code(std::errc::io_error));
       }
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Sync))
       {
-        return fail("Simulated atomic sync failure");
+        return fail("Simulated atomic sync failure", "sync", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (::fsync(file) != 0)
       {
-        return fail("Failed to sync atomic temporary file");
+        return fail("Failed to sync atomic temporary file", "sync", ErrnoCode());
       }
 
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Close))
       {
-        return fail("Simulated atomic close failure");
+        return fail("Simulated atomic close failure", "close", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (::close(file) != 0)
       {
+        const auto cause = ErrnoCode();
         file = -1;
-        ::unlink(temporaryPath.c_str());
-        return SetFileError(error, "Failed to close atomic temporary file");
+        return fail("Failed to close atomic temporary file", "close", cause);
       }
 
       file = -1;
@@ -3996,14 +5653,12 @@ namespace havCSON
 #ifdef HAVCSON_ENABLE_TEST_HOOKS
       if (ShouldFailAtomicWrite(testing::AtomicWriteStage::Replace))
       {
-        ::unlink(temporaryPath.c_str());
-        return SetFileError(error, "Simulated atomic replacement failure");
+        return fail("Simulated atomic replacement failure", "replace", std::make_error_code(std::errc::io_error));
       }
 #endif
       if (::rename(temporaryPath.c_str(), path.c_str()) != 0)
       {
-        ::unlink(temporaryPath.c_str());
-        return SetFileError(error, "Failed to atomically replace destination file");
+        return fail("Failed to atomically replace destination file", "replace", ErrnoCode());
       }
       if (!SyncContainingDirectory(path, error))
       {
@@ -4022,9 +5677,10 @@ namespace havCSON
   // flushes it to disk, and then replaces the destination file in one operation.
   inline bool WriteTextFileAtomic(const std::string& path, std::string_view contents, Error* error = nullptr)
   {
-    if (path.empty())
+    if (path.empty() || path.find('\0') != std::string::npos)
     {
-      return detail::SetFileError(error, "Destination path is empty");
+      return detail::SetFileError(error, "Destination path is empty or contains a null byte", path, "open",
+                                  std::make_error_code(std::errc::invalid_argument));
     }
     return detail::WriteTextFileAtomicImpl(path, contents, error);
   }
