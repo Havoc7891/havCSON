@@ -7,6 +7,10 @@ Havoc's single-file CSON (CoffeeScript Object Notation) library for C++.
 
 REVISION HISTORY
 
+v0.5.1 (2026-09-12)
+- Fixed MSVC compatibility with C++23.
+- Fixed excessive stack usage in the lossless object parser.
+
 v0.5.0 (2026-09-10)
 - Added optional source locations, safe lossless editing, parser resource limits, structured file errors, and source-aware checked access.
 - Fixed parser state resets, identifier rewinding, newline handling, and lossless round trips.
@@ -120,8 +124,8 @@ namespace havCSON
 {
   inline constexpr std::uint32_t VersionMajor = 0;
   inline constexpr std::uint32_t VersionMinor = 5;
-  inline constexpr std::uint32_t VersionPatch = 0;
-  inline constexpr std::string_view VersionString = "0.5.0";
+  inline constexpr std::uint32_t VersionPatch = 1;
+  inline constexpr std::string_view VersionString = "0.5.1";
 
   struct FileCloser
   {
@@ -1055,7 +1059,7 @@ namespace havCSON
         return;
       }
 
-      if (!value.mSource.unique())
+      if (value.mSource.use_count() != 1)
       {
         value.mSource = std::make_shared<SourceInfo>(*value.mSource);
       }
@@ -3493,31 +3497,28 @@ namespace havCSON
         char c = Peek();
         if (c == '{')
         {
-          out.value = Object{};
           return ParseInlineObjectLossless(out, currentIndent);
         }
         if (c == '[')
         {
-          out.value = Array{};
           return ParseArrayLossless(out, currentIndent);
         }
-        if (c == '"' || c == '\'')
+        if (c == '"' || c == '\'' || IsIdentifierStart(c))
         {
-          return ParseQuotedStringOrIndentedObjectLossless(out, currentIndent);
-        }
-        if (IsIdentifierStart(c))
-        {
-          return ParseIdentifierOrIndentedObjectLossless(out, currentIndent);
+          // Complete lookahead before recursion to avoid retaining its stack frame
+          bool isObject = false;
+          const auto result = c == '"' || c == '\''
+            ? ParseQuotedStringOrObjectKeyLossless(out, isObject)
+            : ParseIdentifierOrObjectKeyLossless(out, isObject);
+          if (result != ErrorCode::OK || !isObject)
+          {
+            return result;
+          }
+          return ParseIndentedObjectLossless(out, currentIndent);
         }
         if (IsNumberStart(c))
         {
-          Value tempValue;
-          ErrorCode errorCode = ParseNumber(tempValue);
-          if (errorCode == ErrorCode::OK)
-          {
-            out.value = std::move(tempValue);
-          }
-          return errorCode;
+          return ParseNumber(out.value);
         }
         if (EndOfFile())
         {
@@ -3526,7 +3527,7 @@ namespace havCSON
         return Finish(ErrorCode::UnexpectedChar, nullptr, "Unexpected character while parsing value");
       }
 
-      ErrorCode ParseQuotedStringOrIndentedObjectLossless(LosslessValue& out, int currentIndent)
+      ErrorCode ParseQuotedStringOrObjectKeyLossless(LosslessValue& out, bool& isObject)
       {
         const std::size_t savedPos = mPos;
         const std::size_t savedLine = mLine;
@@ -3546,8 +3547,14 @@ namespace havCSON
         mPos = savedPos;
         mLine = savedLine;
         mCol = savedColumn;
+        isObject = true;
+        return ErrorCode::OK;
+      }
+
+      ErrorCode ParseIndentedObjectLossless(LosslessValue& out, int currentIndent)
+      {
         Object object;
-        errorCode = ParseIndentedObjectBodyLossless(object, out, currentIndent);
+        const auto errorCode = ParseIndentedObjectBodyLossless(object, out, currentIndent);
         if (errorCode == ErrorCode::OK)
         {
           out.value = std::move(object);
@@ -3674,8 +3681,8 @@ namespace havCSON
             }
 
             RecordKeySource(child.value, keySource);
-            out.objectItems.emplace_back(key, child);
-            object.emplace(std::move(key), child.value);
+            object.emplace(key, child.value);
+            out.objectItems.emplace_back(std::move(key), std::move(child));
 
             SkipInlineSpaces();
             bool commentConsumedNewline = false;
@@ -3763,8 +3770,8 @@ namespace havCSON
             return errorCode;
           }
           RecordKeySource(child.value, keySource);
-          out.objectItems.emplace_back(key, child);
-          object.emplace(std::move(key), child.value);
+          object.emplace(key, child.value);
+          out.objectItems.emplace_back(std::move(key), std::move(child));
           SkipWhitespaceAndComments();
           if (Match('}'))
           {
@@ -4063,7 +4070,7 @@ namespace havCSON
         return ErrorCode::OK;
       }
 
-      ErrorCode ParseIdentifierOrIndentedObjectLossless(LosslessValue& out, int currentIndent)
+      ErrorCode ParseIdentifierOrObjectKeyLossless(LosslessValue& out, bool& isObject)
       {
         const auto savedPos = mPos;
         const auto savedColumn = mCol;
@@ -4077,13 +4084,7 @@ namespace havCSON
         {
           mPos = savedPos;
           mCol = savedColumn;
-          Object object;
-          ErrorCode errorCode = ParseIndentedObjectBodyLossless(object, out, currentIndent);
-          if (errorCode != ErrorCode::OK)
-          {
-            return errorCode;
-          }
-          out.value = std::move(object);
+          isObject = true;
           return ErrorCode::OK;
         }
 
@@ -4191,6 +4192,8 @@ namespace havCSON
             blockValue = true;
           }
 
+          // Use one child node to limit stack usage during recursion
+          LosslessValue child;
           if (blockValue)
           {
             std::string blockComment;
@@ -4223,7 +4226,6 @@ namespace havCSON
               return Finish(ErrorCode::InconsistentIndent, nullptr, "Expected deeper indentation for block value");
             }
 
-            LosslessValue child;
             child.blockComment = std::move(blockComment);
             if (!preKeyComments.empty())
             {
@@ -4237,8 +4239,8 @@ namespace havCSON
             }
 
             RecordKeySource(child.value, keySource);
-            outWrapper.objectItems.emplace_back(key, child);
-            obj.emplace(std::move(key), child.value);
+            obj.emplace(key, child.value);
+            outWrapper.objectItems.emplace_back(std::move(key), std::move(child));
 
             // After parsing block value, check if we need to advance to next line
             SkipInlineSpaces();
@@ -4278,7 +4280,6 @@ namespace havCSON
             continue;
           }
 
-          LosslessValue child;
           if (!preKeyComments.empty())
           {
             child.leadingComments.insert(child.leadingComments.end(), preKeyComments.begin(), preKeyComments.end());
@@ -4290,8 +4291,8 @@ namespace havCSON
             return errorCode;
           }
           RecordKeySource(child.value, keySource);
-          outWrapper.objectItems.emplace_back(key, child);
-          obj.emplace(std::move(key), child.value);
+          obj.emplace(key, child.value);
+          outWrapper.objectItems.emplace_back(std::move(key), std::move(child));
 
           SkipInlineSpaces();
           if (Peek() == '#')
